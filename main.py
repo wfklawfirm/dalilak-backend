@@ -44,7 +44,7 @@ MAX_HISTORY     = 6
 # ──────────────────────────────────────────────────────────
 # تحميل System Prompt
 # ──────────────────────────────────────────────────────────
-PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "system_prompt.txt")
+PROMPT_PATH = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
 try:
     with open(PROMPT_PATH, encoding="utf-8") as f:
         SYSTEM_PROMPT = f.read()
@@ -298,5 +298,6 @@ async def chat_stream(req: ChatRequest):
 # ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Dalilak AI Backend يعمل على http://localhost:8000")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Dalilak AI Backend يعمل على http://0.0.0.0:{port}")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
