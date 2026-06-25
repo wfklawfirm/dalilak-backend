@@ -66,6 +66,10 @@ app = FastAPI(
     version="1.0.0",
 )
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "name": "Dalilak AI", "version": "1.0.0"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
