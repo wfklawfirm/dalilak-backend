@@ -211,9 +211,15 @@ async def chat_stream(req: ChatRequest):
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content
                 if delta:
-                    yield f"data: {json.dumps({'type':'token','text':delta}, ensure_ascii=False)}\n\n"
+                    # Send both formats for compatibility
+                    token_data = {
+                        "type": "token",
+                        "text": delta,
+                        "choices": [{"delta": {"content": delta}}]
+                    }
+                    yield f"data: {json.dumps(token_data, ensure_ascii=False)}\n\n"
 
-            yield f"data: {json.dumps({'type':'done'})}\n\n"
+            yield "data: [DONE]\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'type':'error','detail':str(e)})}\n\n"
 
