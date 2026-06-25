@@ -52,10 +52,26 @@ except FileNotFoundError:
     SYSTEM_PROMPT = "أنت دليلك AI، مساعد المواطن اللبناني في كل الشؤون الحكومية."
 
 # ──────────────────────────────────────────────────────────
-# تهيئة العملاء
+# تهيئة العملاء (lazy — تُقرأ المتغيرات عند أول طلب)
 # ──────────────────────────────────────────────────────────
-oai    = AsyncOpenAI(api_key=OPENAI_API_KEY)
-qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
+_oai    = None
+_qdrant = None
+
+def get_oai():
+    global _oai
+    if _oai is None:
+        _oai = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+    return _oai
+
+def get_qdrant():
+    global _qdrant
+    if _qdrant is None:
+        _qdrant = QdrantClient(
+            url=os.environ.get("QDRANT_URL", ""),
+            api_key=os.environ.get("QDRANT_API_KEY", ""),
+            timeout=30,
+        )
+    return _qdrant
 
 # ──────────────────────────────────────────────────────────
 # FastAPI
@@ -95,7 +111,7 @@ class ChatRequest(BaseModel):
 # دوال مساعدة
 # ──────────────────────────────────────────────────────────
 async def get_embedding(text: str) -> list[float]:
-    resp = await oai.embeddings.create(
+    resp = await get_oai().embeddings.create(
         model=EMBEDDING_MODEL,
         input=[text[:12000]],
         dimensions=VECTOR_DIM,
@@ -111,7 +127,7 @@ def search_qdrant(query_vec: list[float], domain: str | None = None) -> list[dic
             must=[FieldCondition(key="domain", match=MatchValue(value=domain))]
         )
 
-    results = qdrant.query_points(
+    results = get_qdrant().query_points(
         collection_name=COLLECTION_NAME,
         query=query_vec,
         limit=MAX_CONTEXT,
@@ -184,10 +200,18 @@ def build_messages(system: str, context: str, history: list[Message], user_msg: 
 # ──────────────────────────────────────────────────────────
 # Endpoints
 # ──────────────────────────────────────────────────────────
+@app.get("/debug")
+async def debug():
+    return {
+        "OPENAI_API_KEY": "set" if os.environ.get("OPENAI_API_KEY") else "MISSING",
+        "QDRANT_URL": os.environ.get("QDRANT_URL", "MISSING"),
+        "QDRANT_API_KEY": "set" if os.environ.get("QDRANT_API_KEY") else "MISSING",
+    }
+
 @app.get("/health")
 async def health():
     try:
-        info = qdrant.get_collection(COLLECTION_NAME)
+        info = get_qdrant().get_collection(COLLECTION_NAME)
         return {
             "status": "ok",
             "collection": COLLECTION_NAME,
