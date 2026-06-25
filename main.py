@@ -272,7 +272,7 @@ async def chat(req: ChatRequest):
     messages = build_messages(SYSTEM_PROMPT, context, req.history, req.message)
 
     # 5. OpenAI
-    resp = await oai.chat.completions.create(
+    resp = await get_oai().chat.completions.create(
         model=model,
         messages=messages,
         max_tokens=MAX_TOKENS,
@@ -325,7 +325,7 @@ async def chat_stream(req: ChatRequest):
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
         # 6. stream الإجابة
-        stream = await oai.chat.completions.create(
+        stream = await get_oai().chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=MAX_TOKENS,
