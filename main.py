@@ -202,10 +202,24 @@ def build_messages(system: str, context: str, history: list[Message], user_msg: 
 # ──────────────────────────────────────────────────────────
 @app.get("/debug")
 async def debug():
+    import httpx
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    qdrant_key = os.environ.get("QDRANT_API_KEY", "")
+    qdrant_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{qdrant_url}/collections",
+                headers={"api-key": qdrant_key},
+            )
+            qdrant_status = f"ok ({r.status_code})"
+    except Exception as e:
+        qdrant_status = f"error: {e}"
     return {
         "OPENAI_API_KEY": "set" if os.environ.get("OPENAI_API_KEY") else "MISSING",
-        "QDRANT_URL": os.environ.get("QDRANT_URL", "MISSING"),
-        "QDRANT_API_KEY": "set" if os.environ.get("QDRANT_API_KEY") else "MISSING",
+        "QDRANT_URL": qdrant_url,
+        "QDRANT_API_KEY": "set" if qdrant_key else "MISSING",
+        "qdrant_connectivity": qdrant_status,
     }
 
 @app.get("/health")
