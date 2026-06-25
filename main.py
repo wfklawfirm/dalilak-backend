@@ -119,28 +119,36 @@ async def get_embedding(text: str) -> list[float]:
     return resp.data[0].embedding
 
 
-def search_qdrant(query_vec: list[float], domain: str | None = None) -> list[dict]:
-    """يبحث في Qdrant ويرجع chunks ذات الصلة"""
-    qdrant_filter = None
-    if domain:
-        qdrant_filter = Filter(
-            must=[FieldCondition(key="domain", match=MatchValue(value=domain))]
-        )
+async def search_qdrant(query_vec: list[float], domain: str | None = None) -> list[dict]:
+    """يبحث في Qdrant عبر REST API مباشرة"""
+    import httpx
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    qdrant_key = os.environ.get("QDRANT_API_KEY", "")
 
-    results = get_qdrant().query_points(
-        collection_name=COLLECTION_NAME,
-        query=query_vec,
-        limit=MAX_CONTEXT,
-        score_threshold=MIN_SCORE,
-        query_filter=qdrant_filter,
-        with_payload=True,
-    ).points
+    body: dict = {
+        "vector": query_vec,
+        "limit": MAX_CONTEXT,
+        "score_threshold": MIN_SCORE,
+        "with_payload": True,
+    }
+    if domain:
+        body["filter"] = {
+            "must": [{"key": "domain", "match": {"value": domain}}]
+        }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{qdrant_url}/collections/{COLLECTION_NAME}/points/search",
+            headers={"api-key": qdrant_key, "Content-Type": "application/json"},
+            json=body,
+        )
+        data = r.json()
 
     chunks = []
-    for r in results:
-        p = r.payload
+    for item in data.get("result", []):
+        p = item.get("payload", {})
         chunks.append({
-            "score":    round(r.score, 3),
+            "score":    round(item.get("score", 0), 3),
             "title":    p.get("title", ""),
             "text":     p.get("text", ""),
             "domain":   p.get("domain", ""),
@@ -224,12 +232,21 @@ async def debug():
 
 @app.get("/health")
 async def health():
+    import httpx
+    qdrant_url = os.environ.get("QDRANT_URL", "")
+    qdrant_key = os.environ.get("QDRANT_API_KEY", "")
     try:
-        info = get_qdrant().get_collection(COLLECTION_NAME)
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{qdrant_url}/collections/{COLLECTION_NAME}",
+                headers={"api-key": qdrant_key},
+            )
+            data = r.json()
+            points = data.get("result", {}).get("points_count", 0)
         return {
             "status": "ok",
             "collection": COLLECTION_NAME,
-            "points": info.points_count,
+            "points": points,
             "timestamp": int(time.time()),
         }
     except Exception as e:
@@ -245,7 +262,7 @@ async def chat(req: ChatRequest):
     query_vec = await get_embedding(req.message)
 
     # 2. بحث في Qdrant
-    chunks = search_qdrant(query_vec, req.domain)
+    chunks = await search_qdrant(query_vec, req.domain)
     context = build_context(chunks)
 
     # 3. اختيار الموديل
@@ -286,7 +303,7 @@ async def chat_stream(req: ChatRequest):
         query_vec = await get_embedding(req.message)
 
         # 2. بحث
-        chunks = search_qdrant(query_vec, req.domain)
+        chunks = await search_qdrant(query_vec, req.domain)
         context = build_context(chunks)
 
         # 3. موديل
