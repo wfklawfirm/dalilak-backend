@@ -67,6 +67,91 @@ def extract_text_from_docx(b64: str) -> str:
     except Exception as e:
         return f"[تعذّر استخراج نص Word: {e}]"
 
+def extract_text_from_excel(b64: str) -> str:
+    try:
+        import openpyxl
+        raw = base64.b64decode(b64)
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        lines = []
+        for sheet in wb.worksheets:
+            lines.append(f"--- ورقة: {sheet.title} ---")
+            for row in sheet.iter_rows(values_only=True):
+                vals = [str(v) if v is not None else "" for v in row]
+                if any(v.strip() for v in vals):
+                    lines.append(" | ".join(vals))
+        return "\n".join(lines)[:15000]
+    except Exception as e:
+        return f"[تعذّر استخراج Excel: {e}]"
+
+def extract_text_from_pptx(b64: str) -> str:
+    try:
+        from pptx import Presentation
+        raw = base64.b64decode(b64)
+        prs = Presentation(io.BytesIO(raw))
+        lines = []
+        for i, slide in enumerate(prs.slides, 1):
+            lines.append(f"--- شريحة {i} ---")
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    lines.append(shape.text.strip())
+        return "\n".join(lines)[:15000]
+    except Exception as e:
+        return f"[تعذّر استخراج PowerPoint: {e}]"
+
+def extract_text_from_csv(b64: str) -> str:
+    try:
+        import csv
+        raw = base64.b64decode(b64).decode("utf-8", errors="replace")
+        reader = csv.reader(io.StringIO(raw))
+        lines = [" | ".join(row) for row in reader if any(c.strip() for c in row)]
+        return "\n".join(lines[:500])[:15000]
+    except Exception as e:
+        return f"[تعذّر قراءة CSV: {e}]"
+
+def extract_text_from_zip(b64: str) -> str:
+    try:
+        import zipfile
+        raw = base64.b64decode(b64)
+        text_exts = {".txt", ".md", ".csv", ".json", ".xml", ".html", ".py", ".js", ".ts"}
+        lines = []
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            lines.append(f"محتويات الأرشيف ({len(zf.namelist())} ملف):")
+            for name in zf.namelist()[:50]:
+                lines.append(f"  - {name}")
+            lines.append("")
+            for name in zf.namelist()[:10]:
+                ext = "." + name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                if ext in text_exts:
+                    try:
+                        content = zf.read(name).decode("utf-8", errors="replace")[:3000]
+                        lines.append(f"=== {name} ===\n{content}")
+                    except Exception:
+                        pass
+        return "\n".join(lines)[:15000]
+    except Exception as e:
+        return f"[تعذّر فتح ZIP: {e}]"
+
+async def transcribe_audio(b64: str, file_type: str, file_name: str) -> str:
+    try:
+        raw = base64.b64decode(b64)
+        ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "mp3"
+        fname = f"audio.{ext}"
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        try:
+            with open(tmp_path, "rb") as f:
+                transcript = await oai().audio.transcriptions.create(
+                    model="whisper-1", file=(fname, f, file_type or "audio/mpeg"),
+                    response_format="text"
+                )
+            return str(transcript)[:15000]
+        finally:
+            os.unlink(tmp_path)
+    except Exception as e:
+        return f"[تعذّر تحويل الصوت: {e}]"
+
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -420,6 +505,11 @@ class CreateUserRequest(BaseModel):
     full_name: str = ""
     phone: str = ""
     plan: str = "trial"
+
+class FileExtractRequest(BaseModel):
+    file_base64: str
+    file_type: str
+    file_name: str
 
 # ═══════════════════════════════════════════════════════════════
 #  FASTAPI APP
@@ -940,209 +1030,4 @@ async def admin_knowledge_search(q: str, admin: dict = Depends(get_admin_user)):
     if not q.strip():
         raise HTTPException(400, detail="أدخل نص البحث")
     vec = await embed(q)
-    chunks = await search_qdrant(vec)
-    return {"query": q, "results": chunks, "count": len(chunks)}
-
-@app.get("/admin/knowledge/count")
-async def admin_knowledge_count(admin: dict = Depends(get_admin_user)):
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{qdrant_url()}/collections/{COLLECTION}", headers=qdrant_headers())
-    info = r.json().get("result", {})
-    return {
-        "collection": COLLECTION,
-        "points_count": info.get("points_count", 0),
-        "segments_count": info.get("segments_count", 0),
-    }
-
-# ═══════════════════════════════════════════════════════════════
-#  CHAT ENDPOINTS
-# ═══════════════════════════════════════════════════════════════
-
-@app.post("/chat")
-async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
-    ck = _ck(req.message, req.domain)
-    cached = _cget(ck)
-    if cached:
-        return cached
-
-    t0 = time.time()
-    vec    = await embed(req.message)
-    chunks = await search_qdrant(vec, req.domain)
-    ctx    = context_str(chunks)
-    model  = pick_model(req.message)
-    msgs   = build_messages(ctx, req.history, req.message)
-
-    resp = await oai().chat.completions.create(
-        model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.3,
-    )
-    elapsed_ms = int((time.time() - t0) * 1000)
-    result = {
-        "answer":      resp.choices[0].message.content,
-        "model":       model,
-        "chunks_used": len(chunks),
-        "elapsed_s":   round(elapsed_ms / 1000, 2),
-        "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
-    }
-    _cset(ck, result)
-    log_query(user["username"], "chat", elapsed_ms)
-    return result
-
-@app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
-    async def generate() -> AsyncGenerator[str, None]:
-        try:
-            t0 = time.time()
-            vec    = await embed(req.message)
-            chunks = await search_qdrant(vec, req.domain)
-            ctx    = context_str(chunks)
-            model  = pick_model(req.message)
-            msgs   = build_messages(ctx, req.history, req.message)
-
-            meta = {
-                "type": "meta", "model": model, "chunks": len(chunks),
-                "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
-            }
-            yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
-
-            stream = await oai().chat.completions.create(
-                model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.3, stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield f"data: {json.dumps({'type':'token','text':delta,'choices':[{'delta':{'content':delta}}]}, ensure_ascii=False)}\n\n"
-
-            yield "data: [DONE]\n\n"
-            log_query(user["username"], "chat_stream", int((time.time() - t0) * 1000))
-        except Exception as e:
-            yield f"data: {json.dumps({'type':'error','detail':str(e)})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-@app.post("/analyze/stream")
-async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_user)):
-    async def generate() -> AsyncGenerator[str, None]:
-        try:
-            is_image = req.file_type.startswith("image/")
-            is_pdf   = req.file_type == "application/pdf"
-            is_word  = "word" in req.file_type or req.file_name.lower().endswith((".docx", ".doc"))
-            is_text  = req.file_type.startswith("text/") or req.file_name.lower().endswith(".txt")
-
-            extracted_text = ""
-            if is_pdf:
-                extracted_text = extract_text_from_pdf(req.file_base64)
-            elif is_word:
-                extracted_text = extract_text_from_docx(req.file_base64)
-            elif is_text:
-                try:
-                    extracted_text = base64.b64decode(req.file_base64).decode("utf-8", errors="replace")[:15000]
-                except Exception:
-                    extracted_text = ""
-
-            search_query = f"{req.file_name} {req.message} {extracted_text[:300]}"
-            try:
-                vec    = await embed(search_query)
-                chunks = await search_qdrant(vec)
-                ctx    = context_str(chunks)
-            except Exception:
-                ctx = ""
-
-            ANALYSIS_PROMPT = SYSTEM_PROMPT + """
-
----
-
-## قواعد تحليل الوثائق
-
-أنت خبير متخصص في تحليل الوثائق الرسمية والقانونية اللبنانية.
-عند تحليل أي وثيقة، اتبع هذا الهيكل الإلزامي بالترتيب:
-
-### 1. 📋 تشخيص الوثيقة
-- نوعها الدقيق (عقد / قرار / طلب / فاتورة / قيد / وكالة / حكم / إلخ)
-- الجهة المُصدِرة والجهة المُستلِمة
-- التاريخ ورقم المرجع إن وجد
-
-### 2. 📌 استخراج البيانات الجوهرية
-استخرج كل المعلومات المهمة: أسماء، أرقام، مبالغ، مواعيد، شروط، التزامات.
-
-### 3. ⚠️ التنبيهات والمخاطر
-هل هناك مواعيد نهائية قريبة؟ بنود مُلزِمة؟ إجراءات واجبة لم تُنفَّذ؟ تناقضات؟
-
-### 4. ✅ الإجراءات العملية المطلوبة (بالترتيب)
-خطوات واضحة ومرقّمة يجب على المواطن اتخاذها.
-
-### 5. 📁 المستندات والمتطلبات
-ما يجب تحضيره: وثائق، صور، طوابع، رسوم.
-
-### 6. 🏛️ الجهة المختصة والتواصل
-الوزارة أو الدائرة المختصة، رقم الهاتف، ساعات العمل.
-
-### 7. 📝 النموذج أو المسودة الجاهزة
-**إلزامي:** إذا استوجبت الوثيقة طلباً أو إفادةً: اكتب مسودة جاهزة بصيغة رسمية.
-
----
-""" + (f"\n\n{ctx}" if ctx else "")
-
-            user_text = f"سؤال/طلب المستخدم: {req.message}\n\nاسم الملف: {req.file_name}"
-            if extracted_text and not extracted_text.startswith("[تعذّر"):
-                user_text += f"\n\n--- نص الوثيقة المستخرج ---\n{extracted_text}\n--- نهاية النص ---"
-
-            if is_image:
-                user_content: list = [
-                    {"type": "image_url", "image_url": {"url": f"data:{req.file_type};base64,{req.file_base64}", "detail": "high"}},
-                    {"type": "text", "text": user_text},
-                ]
-            else:
-                user_content = [{"type": "text", "text": user_text}]
-
-            msgs: list = [{"role": "system", "content": ANALYSIS_PROMPT}]
-            for m in req.history[-MAX_HISTORY:]:
-                msgs.append({"role": m.role, "content": m.content})
-            msgs.append({"role": "user", "content": user_content})
-
-            stream = await oai().chat.completions.create(
-                model=MODEL_SMART, messages=msgs, max_tokens=MAX_DOC_TOKENS,
-                temperature=0.2, stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield f"data: {json.dumps({'type':'token','text':delta,'choices':[{'delta':{'content':delta}}]}, ensure_ascii=False)}\n\n"
-
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type':'error','detail':str(e)})}\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-# ═══════════════════════════════════════════════════════════════
-#  STARTUP
-# ═══════════════════════════════════════════════════════════════
-
-@app.on_event("startup")
-async def startup():
-    admin_username = os.environ.get("ADMIN_USERNAME")
-    admin_password = os.environ.get("ADMIN_PASSWORD")
-    admin_email    = os.environ.get("ADMIN_EMAIL", "admin@dalilak.ai")
-    if admin_username and admin_password:
-        if not db_get_user(admin_username.lower()):
-            db_save_user({
-                "username":         admin_username.lower(),
-                "email":            admin_email,
-                "password_hash":    hash_pw(admin_password),
-                "full_name":        "Admin",
-                "phone":            "",
-                "plan":             "admin",
-                "role":             "admin",
-                "active":           True,
-                "trial_expires_at": None,
-                "paid_until":       None,
-                "created_at":       datetime.now(timezone.utc).isoformat(),
-                "last_login":       None,
-            })
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    chunks = await search_qdrant(
