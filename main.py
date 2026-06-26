@@ -812,6 +812,148 @@ async def admin_list_resets(admin: dict = Depends(get_admin_user)):
             pass
     return {"reset_codes": active}
 
+# ── Extend trial ─────────────────────────────────────────────
+class ExtendTrialRequest(BaseModel):
+    days: int = 7
+
+@app.post("/admin/users/{username}/extend-trial")
+async def admin_extend_trial(username: str, req: ExtendTrialRequest, admin: dict = Depends(get_admin_user)):
+    user = db_get_user(username.lower())
+    if not user:
+        raise HTTPException(404, detail="المستخدم غير موجود")
+    now = datetime.now(timezone.utc)
+    # Extend from now or from current expiry, whichever is later
+    current_exp_str = user.get("trial_expires_at") or now.isoformat()
+    try:
+        current_exp = datetime.fromisoformat(current_exp_str).replace(tzinfo=timezone.utc)
+        base = max(now, current_exp)
+    except Exception:
+        base = now
+    new_exp = (base + timedelta(days=req.days)).isoformat()
+    user["trial_expires_at"] = new_exp
+    if user.get("plan") not in ("paid", "admin"):
+        user["plan"] = "trial"
+    user["active"] = True
+    db_save_user(user)
+    return {"message": f"تم تمديد المهلة {req.days} أيام", "trial_expires_at": new_exp}
+
+# ── Per-user logs ────────────────────────────────────────────
+@app.get("/admin/users/{username}/logs")
+async def admin_user_logs(username: str, admin: dict = Depends(get_admin_user)):
+    _ensure_logs()
+    results, _ = qdrant().scroll(
+        collection_name=LOGS_COL,
+        scroll_filter=Filter(must=[FieldCondition(key="username", match=MatchValue(value=username.lower()))]),
+        limit=200, with_payload=True,
+    )
+    logs = sorted(
+        [r.payload for r in results if r.payload],
+        key=lambda x: x.get("timestamp", ""), reverse=True,
+    )
+    total = len(logs)
+    chat_count = sum(1 for l in logs if "chat" in l.get("type", ""))
+    analyze_count = sum(1 for l in logs if "analyze" in l.get("type", ""))
+    avg_ms = int(sum(l.get("elapsed_ms", 0) for l in logs) / total) if total else 0
+    return {
+        "username": username,
+        "total_queries": total,
+        "chat_count": chat_count,
+        "analyze_count": analyze_count,
+        "avg_response_ms": avg_ms,
+        "logs": logs[:50],  # last 50
+    }
+
+# ── All logs (general report) ────────────────────────────────
+@app.get("/admin/logs")
+async def admin_all_logs(admin: dict = Depends(get_admin_user)):
+    _ensure_logs()
+    results, _ = qdrant().scroll(collection_name=LOGS_COL, limit=1000, with_payload=True)
+    logs = [r.payload for r in results if r.payload]
+    total = len(logs)
+    chat_count = sum(1 for l in logs if "chat" in l.get("type", ""))
+    analyze_count = sum(1 for l in logs if "analyze" in l.get("type", ""))
+    avg_ms = int(sum(l.get("elapsed_ms", 0) for l in logs) / total) if total else 0
+    # Daily activity (last 14 days)
+    now = datetime.now(timezone.utc)
+    daily: dict = {}
+    for l in logs:
+        try:
+            d = datetime.fromisoformat(l.get("timestamp", "")).replace(tzinfo=timezone.utc)
+            if (now - d).days <= 13:
+                key = d.strftime("%Y-%m-%d")
+                daily[key] = daily.get(key, 0) + 1
+        except Exception:
+            pass
+    # Top users
+    user_counts: dict = {}
+    for l in logs:
+        u = l.get("username", "guest")
+        user_counts[u] = user_counts.get(u, 0) + 1
+    top_users = sorted(user_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    return {
+        "total_queries": total,
+        "chat_count": chat_count,
+        "analyze_count": analyze_count,
+        "avg_response_ms": avg_ms,
+        "daily_activity": daily,
+        "top_users": [{"username": u, "count": c} for u, c in top_users],
+    }
+
+# ── Knowledge base management ────────────────────────────────
+class KnowledgeAddRequest(BaseModel):
+    title: str
+    text: str
+    domain: str = ""
+    ministry: str = ""
+    website: str = ""
+    phone: str = ""
+    fees: str = ""
+    source: str = "admin"
+
+@app.post("/admin/knowledge/add")
+async def admin_knowledge_add(req: KnowledgeAddRequest, admin: dict = Depends(get_admin_user)):
+    if not req.title.strip() or not req.text.strip():
+        raise HTTPException(400, detail="العنوان والنص مطلوبان")
+    full_text = f"{req.title}\n{req.text}"
+    vec = await embed(full_text)
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"admin_{req.title}_{req.text[:50]}"))
+    payload = {
+        "title":    req.title.strip(),
+        "text":     req.text.strip(),
+        "domain":   req.domain.strip(),
+        "ministry": req.ministry.strip(),
+        "website":  req.website.strip(),
+        "phone":    req.phone.strip(),
+        "fees":     req.fees.strip(),
+        "source":   req.source,
+        "added_by": admin.get("username"),
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    }
+    qdrant().upsert(
+        collection_name=COLLECTION,
+        points=[PointStruct(id=point_id, vector=vec, payload=payload)],
+    )
+    return {"message": "تمت إضافة المعلومة للقاعدة بنجاح", "id": point_id}
+
+@app.get("/admin/knowledge/search")
+async def admin_knowledge_search(q: str, admin: dict = Depends(get_admin_user)):
+    if not q.strip():
+        raise HTTPException(400, detail="أدخل نص البحث")
+    vec = await embed(q)
+    chunks = await search_qdrant(vec)
+    return {"query": q, "results": chunks, "count": len(chunks)}
+
+@app.get("/admin/knowledge/count")
+async def admin_knowledge_count(admin: dict = Depends(get_admin_user)):
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(f"{qdrant_url()}/collections/{COLLECTION}", headers=qdrant_headers())
+    info = r.json().get("result", {})
+    return {
+        "collection": COLLECTION,
+        "points_count": info.get("points_count", 0),
+        "segments_count": info.get("segments_count", 0),
+    }
+
 # ═══════════════════════════════════════════════════════════════
 #  CHAT ENDPOINTS
 # ═══════════════════════════════════════════════════════════════
