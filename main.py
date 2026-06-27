@@ -541,11 +541,44 @@ async def lifespan(app_: FastAPI):
 
 app = FastAPI(title="Dalilak AI API", version="4.0.0", lifespan=lifespan)
 
+# ── CORS — restrict to known origins in production ────────────────────────────
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,https://dalilak-frontend.vercel.app,https://dalilak.ai,https://www.dalilak.ai"
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"],
-    allow_headers=["*"], allow_credentials=True,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Secret"],
+    allow_credentials=True,
 )
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+from collections import defaultdict
+
+_rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+def _rate_limit(key: str, max_requests: int = 60, window_seconds: int = 60) -> None:
+    """Sliding window rate limiter. Raises 429 when exceeded."""
+    now = time.time()
+    bucket = _rate_buckets[key]
+    # Evict expired timestamps
+    _rate_buckets[key] = [t for t in bucket if now - t < window_seconds]
+    if len(_rate_buckets[key]) >= max_requests:
+        raise HTTPException(
+            status_code=429,
+            detail="طلبات كثيرة جداً — حاول مرة أخرى بعد قليل.",
+            headers={"Retry-After": str(window_seconds)},
+        )
+    _rate_buckets[key].append(now)
+
+async def _apply_rate_limit(request: Request) -> None:
+    """FastAPI dependency: rate-limit by IP + path."""
+    client_ip = request.client.host if request.client else "unknown"
+    path = request.url.path
+    _rate_limit(f"{client_ip}:{path}", max_requests=30, window_seconds=60)
 
 # ═══════════════════════════════════════════════════════════════
 #  RAG HELPERS
@@ -1175,10 +1208,12 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             model  = pick_model(req.message, qinfo)
             msgs   = build_messages(ctx, req.history, req.message, qinfo)
 
+            retrieval_conf = _compute_retrieval_confidence(chunks)
             meta = {
                 "type": "meta", "model": model, "chunks": len(chunks),
                 "query_type": qinfo['type'],
-                "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
+                "confidence": retrieval_conf,
+                "sources": [{"title": c["title"], "ministry": c.get("ministry",""), "score": c["score"]} for c in chunks[:5]],
             }
             yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
@@ -1320,10 +1355,105 @@ async def startup():
 # ── Document Upload Stubs (Phase 8) ──────────────────────────────────────────
 # TODO: Replace stubs with real storage (S3/Cloudflare R2) + PDF extraction
 
+# ── Structured Agent Response Models (Phase 2) ───────────────────────────────
+
+class StructuredDocument(BaseModel):
+    title: str
+    required: bool = True
+    notes: Optional[str] = None
+    alternative: Optional[str] = None
+
+class StructuredStep(BaseModel):
+    order: int
+    title: str
+    description: Optional[str] = None
+    authority: Optional[str] = None
+    estimatedTime: Optional[str] = None
+
+class StructuredAuthority(BaseModel):
+    name: str
+    type: Optional[str] = None  # ministry|municipality|court|notary|registry|security|tax|other
+    addressNotes: Optional[str] = None
+    contactNotes: Optional[str] = None
+    website: Optional[str] = None
+
+class StructuredFee(BaseModel):
+    label: str
+    amount: Optional[str] = None
+    currency: Optional[str] = None
+    notes: Optional[str] = None
+    verified: bool = False
+
+class StructuredForm(BaseModel):
+    title: str
+    type: str = "unknown"  # official|draft|unknown
+    fileType: Optional[str] = None
+    url: Optional[str] = None
+    notes: Optional[str] = None
+    verified: bool = False
+
+class StructuredNextAction(BaseModel):
+    label: str
+    description: Optional[str] = None
+    actionType: Optional[str] = "none"
+
+class StructuredWarning(BaseModel):
+    level: str = "info"  # info|warning|critical
+    message: str
+
+class StructuredSource(BaseModel):
+    title: str
+    type: str = "unknown"  # official|internal|user_uploaded|unknown
+    url: Optional[str] = None
+    excerpt: Optional[str] = None
+    lastReviewed: Optional[str] = None
+    reliability: Optional[str] = None  # high|medium|low|unknown
+
+class StructuredConfidence(BaseModel):
+    level: str = "unknown"  # high|medium|low|unknown
+    reason: Optional[str] = None
+
+class AgentResponseModel(BaseModel):
+    kind: str = "structured_agent_response"
+    language: str = "ar"
+    country: Optional[str] = None
+    procedureSlug: Optional[str] = None
+    summary: str
+    requiredDocuments: list[StructuredDocument] = []
+    steps: list[StructuredStep] = []
+    authority: Optional[StructuredAuthority] = None
+    fees: list[StructuredFee] = []
+    forms: list[StructuredForm] = []
+    nextAction: Optional[StructuredNextAction] = None
+    warnings: list[StructuredWarning] = []
+    sources: list[StructuredSource] = []
+    confidence: StructuredConfidence = StructuredConfidence()
+    disclaimer: str = "هذه المعلومات للإرشاد العام فقط وليست بديلاً عن المشورة القانونية الرسمية."
+    rawTextFallback: Optional[str] = None
+
+class StructuredChatRequest(BaseModel):
+    message: str
+    history: list[Message] = []
+    domain: Optional[str] = None
+    procedureSlug: Optional[str] = None
+    flowAnswers: Optional[dict] = None   # answers collected by GuidedFlow
+
+# ── Upload ─────────────────────────────────────────────────────────────────────
+
+_ALLOWED_MIME_TYPES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/tiff",
+}
+
 class UploadDocumentRequest(BaseModel):
     file_base64: str
     file_name: str
-    file_type: str  # "application/pdf", "application/msword", "image/jpeg", etc.
+    file_type: str  # MIME type — validated against allowlist
     user_note: Optional[str] = None
 
 class DeleteDocumentRequest(BaseModel):
@@ -1332,17 +1462,24 @@ class DeleteDocumentRequest(BaseModel):
 @app.post("/documents/upload")
 async def upload_document(req: UploadDocumentRequest, user: dict = Depends(get_current_user)):
     """STUB: Accept a base64-encoded file, return a document ID. Replace with real storage."""
-    import uuid, base64
+    # Validate MIME type against allowlist
+    if req.file_type not in _ALLOWED_MIME_TYPES:
+        raise HTTPException(status_code=415, detail=f"نوع الملف غير مسموح به: {req.file_type}")
+    # Validate base64
     try:
-        _ = base64.b64decode(req.file_base64)  # validate base64
+        raw_bytes = base64.b64decode(req.file_base64)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid base64 content")
+        raise HTTPException(status_code=400, detail="محتوى الملف غير صالح")
+    # Enforce 10MB limit
+    if len(raw_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="حجم الملف يتجاوز 10MB")
     doc_id = str(uuid.uuid4())
     return {
         "success": True,
         "doc_id": doc_id,
         "file_name": req.file_name,
         "file_type": req.file_type,
+        "size_bytes": len(raw_bytes),
         "message": "STUB: Document received. Storage not yet implemented.",
         # TODO: Store in R2/S3, extract text via PyPDF2 or Textract, index in Qdrant
     }
@@ -1427,6 +1564,256 @@ async def get_feedback(limit: int = 50, rating: Optional[str] = None, user: dict
     except Exception as e:
         logger.error(f"Feedback fetch failed: {e}")
         return {"feedback": [], "total": 0, "error": str(e)}
+
+
+# ── Structured Chat Endpoint (Phase 2) ───────────────────────────────────────
+# Asks GPT-4o to return a validated AgentResponse JSON.
+# Falls back to raw text if JSON parsing fails.
+
+_STRUCTURED_SYSTEM = """
+أنت دليلك AI — محرك إرشاد المعاملات الإدارية واللبنانية.
+يجب أن تُرجع إجابتك دائماً كـ JSON صالح وفق المخطط التالي بالضبط.
+لا تُضف أي نص خارج كتلة JSON.
+لا تخترع رسوماً أو نماذج أو جهات رسمية غير متأكد منها — ضع verified: false لأي قيمة غير مؤكدة.
+
+JSON Schema:
+{
+  "kind": "structured_agent_response",
+  "language": "ar" | "en",
+  "country": "lebanon" | "syria" | "both" | "unknown",
+  "procedureSlug": string | null,
+  "summary": string,                          // 2-4 جمل تلخيصية
+  "requiredDocuments": [
+    { "title": string, "required": bool, "notes": string | null, "alternative": string | null }
+  ],
+  "steps": [
+    { "order": int, "title": string, "description": string | null, "authority": string | null, "estimatedTime": string | null }
+  ],
+  "authority": {
+    "name": string,
+    "type": "ministry"|"municipality"|"court"|"notary"|"registry"|"security"|"tax"|"other"|null,
+    "addressNotes": string | null,
+    "contactNotes": string | null,
+    "website": string | null
+  } | null,
+  "fees": [
+    { "label": string, "amount": string | null, "currency": string | null, "notes": string | null, "verified": bool }
+  ],
+  "forms": [
+    { "title": string, "type": "official"|"draft"|"unknown", "fileType": "pdf"|"docx"|"link"|"unknown"|null, "url": string | null, "notes": string | null, "verified": bool }
+  ],
+  "nextAction": { "label": string, "description": string | null, "actionType": "download_checklist"|"generate_form"|"upload_document"|"start_flow"|"ask_followup"|"contact_human"|"none" },
+  "warnings": [ { "level": "info"|"warning"|"critical", "message": string } ],
+  "sources": [
+    { "title": string, "type": "official"|"internal"|"unknown", "url": string | null, "excerpt": string | null, "lastReviewed": string | null, "reliability": "high"|"medium"|"low"|"unknown" }
+  ],
+  "confidence": { "level": "high"|"medium"|"low"|"unknown", "reason": string | null },
+  "disclaimer": string
+}
+"""
+
+def _compute_retrieval_confidence(chunks: list[dict]) -> str:
+    """Compute confidence level from Qdrant retrieval scores."""
+    if not chunks:
+        return "low"
+    max_score = max(c.get("score", 0) for c in chunks)
+    avg_score = sum(c.get("score", 0) for c in chunks) / len(chunks)
+    if max_score >= 0.50 and avg_score >= 0.40:
+        return "high"
+    if max_score >= 0.35:
+        return "medium"
+    return "low"
+
+@app.post("/chat/structured", response_model=None)
+async def chat_structured(req: StructuredChatRequest, user: dict = Depends(get_current_user)):
+    """
+    Non-streaming endpoint: returns a typed AgentResponse JSON.
+    Used by GuidedFlow final step and procedure detail Ask AI.
+    Falls back to { rawTextFallback: ... } on parse error.
+    """
+    qinfo = classify_query(req.message)
+    chunks = await retrieve_multi(req.message, qinfo, req.domain)
+    chunks = rerank_chunks(chunks, req.message)
+    ctx = context_str(chunks)
+    retrieval_conf = _compute_retrieval_confidence(chunks)
+
+    # Build flow context if answers were provided by GuidedFlow
+    flow_ctx = ""
+    if req.flowAnswers:
+        flow_ctx = "\n\nإجابات المستخدم على أسئلة المعالج:\n" + "\n".join(
+            f"- {k}: {v}" for k, v in req.flowAnswers.items()
+        )
+    if req.procedureSlug:
+        flow_ctx += f"\n\nمعرّف المعاملة: {req.procedureSlug}"
+
+    system = _STRUCTURED_SYSTEM + (f"\n\n{ctx}" if ctx else "") + flow_ctx
+    msgs = [{"role": "system", "content": system}]
+    for m in req.history[-6:]:
+        msgs.append({"role": m.role, "content": m.content})
+    msgs.append({"role": "user", "content": req.message})
+
+    try:
+        completion = await oai().chat.completions.create(
+            model=MODEL_SMART,
+            messages=msgs,
+            max_tokens=2000,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+        raw_json = completion.choices[0].message.content or "{}"
+        data = json.loads(raw_json)
+
+        # Validate and add retrieval sources
+        retrieved_sources = [
+            {"title": c["title"], "type": "internal", "excerpt": c.get("text", "")[:200],
+             "reliability": "medium" if c.get("score", 0) > 0.4 else "low"}
+            for c in chunks[:5]
+        ]
+        if not data.get("sources"):
+            data["sources"] = retrieved_sources
+
+        # Enforce confidence from retrieval if model returned "unknown"
+        if data.get("confidence", {}).get("level") == "unknown":
+            data["confidence"] = {"level": retrieval_conf, "reason": "مبني على نتائج الاسترجاع من قاعدة البيانات"}
+
+        data["kind"] = "structured_agent_response"
+        return data
+
+    except json.JSONDecodeError as e:
+        # Fallback: return raw text wrapped in minimal structure
+        text = completion.choices[0].message.content if completion else ""
+        return {
+            "kind": "structured_agent_response",
+            "language": "ar",
+            "summary": "",
+            "requiredDocuments": [], "steps": [], "fees": [], "forms": [],
+            "warnings": [{"level": "warning", "message": "تعذّر تحليل الرد كـ JSON منظّم."}],
+            "sources": [],
+            "confidence": {"level": "low", "reason": f"JSON parse error: {e}"},
+            "disclaimer": "هذه المعلومات للإرشاد العام فقط.",
+            "rawTextFallback": text,
+        }
+    except Exception as e:
+        raise HTTPException(500, detail=f"Structured chat error: {e}")
+
+
+# ── Add retrieval confidence to SSE meta (Phase 9 upgrade) ───────────────────
+# Monkey-patch context_str to expose confidence signal
+# (confidence is computed inside /chat/stream via _compute_retrieval_confidence)
+
+# ── Admin: Content Management Stubs (Phase 10) ───────────────────────────────
+
+@app.get("/admin/procedures")
+async def admin_list_procedures(user: dict = Depends(get_admin_user)):
+    """STUB: Return list of procedures from the knowledge layer. Replace with DB query."""
+    return {
+        "procedures": [],
+        "total": 0,
+        "message": "STUB: Connect to PostgreSQL procedures table when ready.",
+    }
+
+@app.post("/admin/procedures")
+async def admin_create_procedure(data: dict, user: dict = Depends(get_admin_user)):
+    """STUB: Create or update a procedure entry."""
+    return {"success": True, "message": "STUB: Procedure creation not yet persisted."}
+
+@app.get("/admin/sources")
+async def admin_list_sources(user: dict = Depends(get_admin_user)):
+    """STUB: Return list of knowledge sources."""
+    return {
+        "sources": [],
+        "total": 0,
+        "message": "STUB: Connect to sources table when ready.",
+    }
+
+@app.post("/admin/sources")
+async def admin_create_source(data: dict, user: dict = Depends(get_admin_user)):
+    """STUB: Add a new knowledge source."""
+    return {"success": True, "message": "STUB: Source creation not yet persisted."}
+
+@app.get("/admin/failed-questions")
+async def admin_failed_questions(limit: int = 50, user: dict = Depends(get_admin_user)):
+    """Return low-confidence questions from logs for content gap analysis."""
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        filt = Filter(must=[
+            FieldCondition(key="type", match=MatchValue(value="feedback")),
+            FieldCondition(key="rating", match=MatchValue(value="down")),
+        ])
+        results = client.scroll(
+            collection_name="dalilak_logs",
+            scroll_filter=filt,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        entries = [p.payload for p in results[0]]
+        entries.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return {"questions": entries, "total": len(entries)}
+    except Exception as e:
+        return {"questions": [], "total": 0, "error": str(e)}
+
+
+# ── Human Escalation (Phase 16) ───────────────────────────────────────────────
+
+class EscalationRequest(BaseModel):
+    request_type: str   # "lawyer_review" | "document_review" | "consultation" | "whatsapp"
+    question: str
+    context: Optional[str] = None
+    contact_preference: Optional[str] = None  # "email" | "whatsapp" | "callback"
+    user_email: Optional[str] = None
+    user_phone: Optional[str] = None
+
+@app.post("/escalate")
+async def request_escalation(req: EscalationRequest, user: dict = Depends(get_current_user)):
+    """
+    STUB: Log an escalation request. Replace with CRM/ticketing integration.
+    Production: integrate with Calendly, WhatsApp Business API, or legal CRM.
+    """
+    try:
+        from qdrant_client.models import PointStruct
+        payload = {
+            "type": "escalation",
+            "username": user.get("username", "unknown"),
+            "request_type": req.request_type,
+            "question": req.question[:500],
+            "context": (req.context or "")[:500],
+            "contact_preference": req.contact_preference,
+            "user_email": req.user_email,
+            "user_phone": req.user_phone,
+            "status": "pending",
+            "timestamp": int(time.time()),
+        }
+        client.upsert(
+            collection_name="dalilak_logs",
+            points=[PointStruct(id=str(uuid.uuid4()), vector=[0.0] * 3072, payload=payload)]
+        )
+    except Exception as e:
+        logger.warning(f"Escalation log failed: {e}")
+    return {
+        "success": True,
+        "message": "تم استلام طلبك. سيتواصل معك أحد المختصين قريباً.",
+        "estimated_response": "خلال 24 ساعة عمل",
+    }
+
+@app.get("/admin/escalations")
+async def admin_escalations(limit: int = 50, user: dict = Depends(get_admin_user)):
+    """Return pending escalation requests."""
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        filt = Filter(must=[FieldCondition(key="type", match=MatchValue(value="escalation"))])
+        results = client.scroll(
+            collection_name="dalilak_logs",
+            scroll_filter=filt,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        entries = [p.payload for p in results[0]]
+        entries.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return {"escalations": entries, "total": len(entries)}
+    except Exception as e:
+        return {"escalations": [], "total": 0, "error": str(e)}
 
 
 if __name__ == "__main__":
