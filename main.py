@@ -498,28 +498,31 @@ _PRELOAD_QUESTIONS = [
 ]
 
 async def _preload() -> None:
-    """Warm embedding cache for common questions at startup."""
-    await asyncio.sleep(3)  # Let server fully start first
+    """Warm embedding + answer cache for the 15 most common questions at startup."""
+    await asyncio.sleep(4)  # Let server fully start first
     for q in _PRELOAD_QUESTIONS:
         try:
             ck = _ck(q, None)
-            if not _cget(ck):
-                vec = await embed(q)                   # caches embedding
-                chunks = await search_qdrant(vec)      # fetch context
-                ctx = context_str(chunks)
-                model = pick_model(q)
-                msgs = build_messages(ctx, [], q)
-                resp = await oai().chat.completions.create(
-                    model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.1,
-                )
-                result = {
-                    "answer":      resp.choices[0].message.content,
-                    "model":       model,
-                    "chunks_used": len(chunks),
-                    "elapsed_s":   0.0,
-                    "sources":     [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
-                }
-                _cset(ck, result)
+            if _cget(ck):
+                continue  # Already cached
+            qinfo  = classify_query(q)
+            chunks = await retrieve_multi(q, qinfo, None)
+            chunks = rerank_chunks(chunks, q)
+            ctx    = context_str(chunks)
+            model  = pick_model(q, qinfo)
+            msgs   = build_messages(ctx, [], q, qinfo)
+            resp   = await oai().chat.completions.create(
+                model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.1,
+            )
+            result = {
+                "answer":      resp.choices[0].message.content,
+                "model":       model,
+                "chunks_used": len(chunks),
+                "elapsed_s":   0.0,
+                "query_type":  qinfo['type'],
+                "sources":     [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
+            }
+            _cset(ck, result)
         except Exception:
             pass
 
@@ -586,37 +589,191 @@ async def search_qdrant(vec: list, domain: Optional[str] = None) -> list:
         for x in items
     ]
 
+# ═══════════════════════════════════════════════════════════════
+#  QUERY INTELLIGENCE
+# ═══════════════════════════════════════════════════════════════
+
+# Patterns by question type (Arabic + English)
+_PATTERNS = {
+    'comparative': re.compile(
+        r'فرق|مقارنة|أفضل|أحسن|أسرع|أرخص|بدلاً|عوضاً|difference|compare|vs\b|versus|better|'
+        r'أم\s|ام\s|أو\s.*\sأو', re.I),
+    'legal': re.compile(
+        r'مادة|قانون|مرسوم|نظام|قرار وزاري|شريعة|تشريع|نص قانوني|حق قانوني|'
+        r'article|law|decree|legislation|legal right|statute|regulation', re.I),
+    'eligibility': re.compile(
+        r'هل أستطيع|هل يمكنني|هل أحق|هل يحق لي|هل أستحق|مؤهل|شروط الاستفادة|'
+        r'can i|am i eligible|do i qualify|entitled to', re.I),
+    'procedural': re.compile(
+        r'كيف|خطوات|إجراءات|طريقة|آلية|مراحل|ماذا أفعل|ما الذي يجب|'
+        r'how (to|do|can)|steps|procedure|process|what do i (need|have to)', re.I),
+    'factual': re.compile(
+        r'كم|رسوم|تكلفة|سعر|مدة|وقت|متى|أين|موقع|عنوان|هاتف|'
+        r'how much|fee|cost|price|duration|how long|when|where|address|phone', re.I),
+}
+
+_MULTI_SPLIT = re.compile(r'[،,؛;]\s*|\bو(أيضاً|كذلك|أيضا)?\b|\bوكيف\b|\bوماذا\b|\bوهل\b|\bوما\b', re.I)
+
+
+def classify_query(msg: str) -> dict:
+    """
+    Returns:
+      type       : 'comparative' | 'legal' | 'eligibility' | 'procedural' | 'factual' | 'general'
+      multipart  : bool — question has ≥2 distinct sub-questions
+      complexity : 0-10 — drives model choice and retrieval depth
+    """
+    msg_n = _normalize(msg)
+
+    qtype = 'general'
+    for t, pat in _PATTERNS.items():
+        if pat.search(msg):
+            qtype = t
+            break
+
+    # Count distinct question words — proxy for sub-questions
+    q_words = re.findall(r'\b(كيف|ما|هل|متى|أين|من|لماذا|كم|how|what|when|where|why|who|which)\b', msg, re.I)
+    is_multipart = len(q_words) >= 2
+
+    word_count = len(msg.split())
+    complexity = min(10, word_count // 6 + len(q_words) + (3 if is_multipart else 0) +
+                     (2 if qtype in ('legal', 'comparative') else 0))
+
+    return {'type': qtype, 'multipart': is_multipart, 'complexity': complexity}
+
+
+def split_subqueries(msg: str) -> list[str]:
+    """Split a multi-part question into sub-queries for parallel retrieval."""
+    parts = _MULTI_SPLIT.split(msg)
+    # Keep parts that look like full questions (≥4 words)
+    meaningful = [p.strip() for p in parts if len(p.split()) >= 4]
+    return meaningful[:3] if meaningful else [msg]
+
+
+async def retrieve_multi(msg: str, qinfo: dict, domain: Optional[str]) -> list[dict]:
+    """
+    Multi-query retrieval:
+    - Always retrieves for the full question
+    - If multi-part, also retrieves for each sub-question
+    - Deduplicates by title, keeps top MAX_CTX by score
+    """
+    queries = [msg]
+    if qinfo['multipart'] and qinfo['complexity'] >= 4:
+        queries += split_subqueries(msg)
+
+    seen: dict[str, dict] = {}
+    tasks = [embed(q) for q in queries]
+    vecs = await asyncio.gather(*tasks, return_exceptions=True)
+
+    search_tasks = []
+    for vec in vecs:
+        if isinstance(vec, list):
+            search_tasks.append(search_qdrant(vec, domain))
+
+    results = await asyncio.gather(*search_tasks, return_exceptions=True)
+    for chunks in results:
+        if isinstance(chunks, list):
+            for c in chunks:
+                title = c['title']
+                # Keep the highest-scoring version of each chunk
+                if title not in seen or c['score'] > seen[title]['score']:
+                    seen[title] = c
+
+    merged = list(seen.values())
+    merged.sort(key=lambda x: x['score'], reverse=True)
+    return merged[:MAX_CTX]
+
+
+def rerank_chunks(chunks: list[dict], query: str) -> list[dict]:
+    """
+    Keyword-overlap reranker on top of vector similarity.
+    Pulls up chunks whose text/title contains more query keywords.
+    """
+    # Arabic words ≥3 chars + English words ≥4 chars
+    keywords = set(re.findall(r'[؀-ۿ]{3,}|[a-zA-Z]{4,}', query.lower()))
+    for c in chunks:
+        text = (c.get('title', '') + ' ' + c.get('text', '')).lower()
+        hits = sum(1 for kw in keywords if kw in text)
+        c['_rr'] = c['score'] + hits * 0.008   # gentle boost
+    chunks.sort(key=lambda x: x.get('_rr', x['score']), reverse=True)
+    return chunks
+
+
+def type_hint(qinfo: dict) -> str:
+    """Inject type-specific answering instructions into the system prompt."""
+    hints = {
+        'procedural':  "\n\n📋 نوع السؤال: **إجرائي** — الإجابة الإلزامية:\n"
+                       "  • ابدأ بنظرة عامة من جملتين\n"
+                       "  • اذكر المستندات المطلوبة في قائمة\n"
+                       "  • اشرح الخطوات مرقّمةً بالترتيب الزمني الصحيح\n"
+                       "  • اذكر الرسوم والمدة الزمنية والجهة المختصة",
+        'legal':       "\n\n⚖️ نوع السؤال: **قانوني** — الإجابة الإلزامية:\n"
+                       "  • اذكر المادة والمرسوم أو القانون بالرقم الدقيق\n"
+                       "  • ميّز بين نص القانون وتطبيقه الفعلي\n"
+                       "  • إذا تعدّدت المراجع القانونية رتّبها من الأعلى إلى الأدنى في التسلسل\n"
+                       "  • نبّه إلى أي تعديلات أو استثناءات",
+        'comparative': "\n\n📊 نوع السؤال: **مقارن** — الإجابة الإلزامية:\n"
+                       "  • افتح بجدول مقارنة أو نقاط موازية للخيارين/الخيارات\n"
+                       "  • اذكر الفروق العملية (الوقت، التكلفة، الجهة، الشروط)\n"
+                       "  • اختم بتوصية واضحة حسب الحالة الأكثر شيوعاً",
+        'eligibility': "\n\n✅ نوع السؤال: **أهلية/استحقاق** — الإجابة الإلزامية:\n"
+                       "  • اذكر الشروط الكاملة مرقّمةً\n"
+                       "  • اذكر الحالات المستثناة\n"
+                       "  • اختم بإجابة صريحة: نعم / لا / يعتمد على (مع توضيح)\n"
+                       "  • اذكر الجهة المختصة لتقديم الطلب",
+        'factual':     "\n\n📌 نوع السؤال: **معلوماتي** — ابدأ بالإجابة المباشرة (رقم / تاريخ / جهة) ثم الشرح.",
+        'general':     "",
+    }
+    multipart = "\n\n📑 السؤال متعدد الأجزاء — أجب على **كل جزء بشكل مستقل** تحت عنوان فرعي واضح." \
+                if qinfo.get('multipart') else ""
+    return hints.get(qinfo.get('type', 'general'), '') + multipart
+
+
 def context_str(chunks: list) -> str:
     if not chunks:
-        return ""
-    parts = ["=== قاعدة البيانات — المعلومات ذات الصلة ==="]
+        return "[ملاحظة للنموذج: لم يُعثر على معلومات محددة في قاعدة البيانات. " \
+               "أجب بناءً على معرفتك الموثوقة بالقانون اللبناني، " \
+               "واذكر صراحةً أن المعلومات من معرفة عامة لا من قاعدة البيانات الرسمية.]"
+
+    max_score = max(c['score'] for c in chunks)
+    low_conf = max_score < 0.31
+
+    parts = []
+    if low_conf:
+        parts.append("[تنبيه: الصلة بين السؤال والبيانات المتوفرة منخفضة. "
+                     "استخدم المعلومات بحذر وأشر إلى أي غموض في نهاية إجابتك.]")
+    parts.append("=== قاعدة البيانات — المعلومات ذات الصلة ===")
     for i, c in enumerate(chunks, 1):
         parts.append(f"\n[{i}] {c['title']}")
-        if c.get("ministry"):       parts.append(f"الجهة المختصة: {c['ministry']}")
-        if c.get("category"):       parts.append(f"القطاع: {c['category']}")
+        if c.get("ministry"):        parts.append(f"الجهة المختصة: {c['ministry']}")
+        if c.get("category"):        parts.append(f"القطاع: {c['category']}")
         parts.append(c["text"])
-        if c.get("fees"):           parts.append(f"الرسوم: {c['fees']}")
-        if c.get("processing_time"):parts.append(f"مدة الإنجاز: {c['processing_time']}")
-        if c.get("website"):        parts.append(f"الموقع: {c['website']}")
-        if c.get("phone"):          parts.append(f"الهاتف: {c['phone']}")
+        if c.get("fees"):            parts.append(f"الرسوم: {c['fees']}")
+        if c.get("processing_time"): parts.append(f"مدة الإنجاز: {c['processing_time']}")
+        if c.get("website"):         parts.append(f"الموقع: {c['website']}")
+        if c.get("phone"):           parts.append(f"الهاتف: {c['phone']}")
         parts.append("---")
     return "\n".join(parts)
 
-def pick_model(msg: str) -> str:
-    # Use fast model only for very short greetings/simple queries
-    simple = ["مرحبا", "أهلا", "شكرا", "hello", "hi", "كيفك", "كيف حالك"]
-    if len(msg) < 30 and any(s in msg.lower() for s in simple):
-        return MODEL_FAST
-    return MODEL_SMART  # gpt-4o for all real questions
 
-def build_messages(ctx: str, history: list, user_msg: str) -> list:
-    legal_reminder = """
-\n\n⚡ تعليمات إلزامية لهذه الإجابة:
-1. اذكر المواد القانونية والمراسيم ذات الصلة في قسم "📚 الأساس القانوني"
-2. كن دقيقاً وشاملاً — لا تحذف خطوة أو وثيقة
-3. درجة الحرارة صفر — لا تخترع أي معلومة غير موجودة في السياق أو في معرفتك المؤكدة
-4. اختم بـ ⚠️ إذا كانت هناك شروط استثنائية أو تحذيرات مهمة"""
-    system = SYSTEM_PROMPT + legal_reminder + (f"\n\n{ctx}" if ctx else "")
+def pick_model(msg: str, qinfo: Optional[dict] = None) -> str:
+    """Route to fast or smart model. Smart (gpt-4o) for all real questions."""
+    simple = ["مرحبا", "أهلا", "شكرا", "hello", "hi", "كيفك", "كيف حالك", "شو أخبارك"]
+    if len(msg) < 35 and any(s in msg.lower() for s in simple):
+        return MODEL_FAST
+    return MODEL_SMART
+
+
+def build_messages(ctx: str, history: list, user_msg: str,
+                   qinfo: Optional[dict] = None) -> list:
+    hint = type_hint(qinfo) if qinfo else ""
+    base_reminder = (
+        "\n\n⚡ تعليمات إلزامية لهذه الإجابة:\n"
+        "1. اذكر المواد القانونية والمراسيم ذات الصلة في قسم \"📚 الأساس القانوني\"\n"
+        "2. كن دقيقاً وشاملاً — لا تحذف خطوة أو وثيقة\n"
+        "3. لا تخترع أي معلومة غير موجودة في السياق أو في معرفتك المؤكدة\n"
+        "4. اختم بـ ⚠️ إذا كانت هناك شروط استثنائية أو تحذيرات مهمة"
+    )
+    system = SYSTEM_PROMPT + hint + base_reminder + (f"\n\n{ctx}" if ctx else "")
     msgs = [{"role": "system", "content": system}]
     for m in history[-MAX_HISTORY:]:
         msgs.append({"role": m.role, "content": m.content})
@@ -982,12 +1139,13 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     if cached:
         return cached
 
-    t0 = time.time()
-    vec    = await embed(req.message)
-    chunks = await search_qdrant(vec, req.domain)
+    t0     = time.time()
+    qinfo  = classify_query(req.message)
+    chunks = await retrieve_multi(req.message, qinfo, req.domain)
+    chunks = rerank_chunks(chunks, req.message)
     ctx    = context_str(chunks)
-    model  = pick_model(req.message)
-    msgs   = build_messages(ctx, req.history, req.message)
+    model  = pick_model(req.message, qinfo)
+    msgs   = build_messages(ctx, req.history, req.message, qinfo)
 
     resp = await oai().chat.completions.create(
         model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.1,
@@ -998,6 +1156,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
         "model":       model,
         "chunks_used": len(chunks),
         "elapsed_s":   round(elapsed_ms / 1000, 2),
+        "query_type":  qinfo['type'],
         "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
     }
     _cset(ck, result)
@@ -1008,15 +1167,17 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
 async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
     async def generate() -> AsyncGenerator[str, None]:
         try:
-            t0 = time.time()
-            vec    = await embed(req.message)
-            chunks = await search_qdrant(vec, req.domain)
+            t0     = time.time()
+            qinfo  = classify_query(req.message)
+            chunks = await retrieve_multi(req.message, qinfo, req.domain)
+            chunks = rerank_chunks(chunks, req.message)
             ctx    = context_str(chunks)
-            model  = pick_model(req.message)
-            msgs   = build_messages(ctx, req.history, req.message)
+            model  = pick_model(req.message, qinfo)
+            msgs   = build_messages(ctx, req.history, req.message, qinfo)
 
             meta = {
                 "type": "meta", "model": model, "chunks": len(chunks),
+                "query_type": qinfo['type'],
                 "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
             }
             yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
