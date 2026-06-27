@@ -2,15 +2,19 @@
 # -*- coding: utf-8 -*-
 """Dalilak AI — FastAPI Backend v4 (Auth + Subscriptions + Admin)"""
 
+import asyncio
 import base64
 import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Optional
 
@@ -135,15 +139,43 @@ def qdrant_url() -> str:
 def qdrant_headers() -> dict:
     return {"api-key": os.environ.get("QDRANT_API_KEY", ""), "Content-Type": "application/json"}
 
+# ── Persistent async HTTP client for Qdrant (reuse connections) ──
+_http: Optional[httpx.AsyncClient] = None
+
+def http() -> httpx.AsyncClient:
+    global _http
+    if _http is None or _http.is_closed:
+        _http = httpx.AsyncClient(
+            timeout=20,
+            limits=httpx.Limits(max_connections=30, max_keepalive_connections=15),
+        )
+    return _http
+
 # ═══════════════════════════════════════════════════════════════
-#  LRU ANSWER CACHE
+#  QUERY NORMALIZER  (strips diacritics + unifies whitespace)
 # ═══════════════════════════════════════════════════════════════
 
-_CACHE_MAX = 200
+_AR_DIACRITICS = re.compile(
+    r'[ؐ-ًؚ-ٰٟ'
+    r'ۖ-ۜ۟-۪ۤۧۨ-ۭ]'
+)
+
+def _normalize(text: str) -> str:
+    """Strip Arabic diacritics, NFKC-normalize, collapse whitespace, lowercase."""
+    t = _AR_DIACRITICS.sub('', text)
+    t = unicodedata.normalize('NFKC', t)
+    t = re.sub(r'\s+', ' ', t).strip().lower()
+    return t
+
+# ═══════════════════════════════════════════════════════════════
+#  LRU ANSWER CACHE  (500 entries, normalize-keyed)
+# ═══════════════════════════════════════════════════════════════
+
+_CACHE_MAX = 500
 _cache: OrderedDict[str, dict] = OrderedDict()
 
 def _ck(q: str, d: Optional[str]) -> str:
-    return hashlib.md5(f"{q.strip().lower()}||{d or ''}".encode()).hexdigest()
+    return hashlib.md5(f"{_normalize(q)}||{d or ''}".encode()).hexdigest()
 
 def _cget(key: str) -> Optional[dict]:
     v = _cache.get(key)
@@ -156,6 +188,28 @@ def _cset(key: str, val: dict) -> None:
     _cache.move_to_end(key)
     while len(_cache) > _CACHE_MAX:
         _cache.popitem(last=False)
+
+# ═══════════════════════════════════════════════════════════════
+#  EMBEDDING VECTOR CACHE  (avoid repeat OpenAI embed calls)
+# ═══════════════════════════════════════════════════════════════
+
+_EMCACHE_MAX = 500
+_emcache: OrderedDict[str, list] = OrderedDict()
+
+def _ek(text: str) -> str:
+    return hashlib.md5(_normalize(text).encode()).hexdigest()
+
+def _emget(key: str) -> Optional[list]:
+    v = _emcache.get(key)
+    if v is not None:
+        _emcache.move_to_end(key)
+    return v
+
+def _emset(key: str, vec: list) -> None:
+    _emcache[key] = vec
+    _emcache.move_to_end(key)
+    while len(_emcache) > _EMCACHE_MAX:
+        _emcache.popitem(last=False)
 
 # ═══════════════════════════════════════════════════════════════
 #  PASSWORD HELPERS
@@ -422,10 +476,67 @@ class CreateUserRequest(BaseModel):
     plan: str = "trial"
 
 # ═══════════════════════════════════════════════════════════════
+#  STARTUP PRELOADER  (warm embedding + answer cache)
+# ═══════════════════════════════════════════════════════════════
+
+_PRELOAD_QUESTIONS = [
+    "كيف أستخرج جواز سفر لبناني",
+    "كيف أستخرج بطاقة هوية لبنانية",
+    "كيف أسجل سيارة جديدة",
+    "كيف أستخرج شهادة ميلاد",
+    "كيف أسجل شركة في لبنان",
+    "كيف أستخرج تصريح بناء",
+    "كيف أجدد رخصة القيادة",
+    "كيف أسجل الزواج الرسمي",
+    "كيف أنقل ملكية عقار",
+    "كيف أستخرج شهادة عدم محكومية",
+    "كيف أسجل مولود",
+    "كيف أحصل على إجازة مزاولة مهنة",
+    "ما رسوم التسجيل في الضمان الاجتماعي",
+    "كيف أطعن في قرار إداري",
+    "كيف أجدد إقامة الأجانب في لبنان",
+]
+
+async def _preload() -> None:
+    """Warm embedding cache for common questions at startup."""
+    await asyncio.sleep(3)  # Let server fully start first
+    for q in _PRELOAD_QUESTIONS:
+        try:
+            ck = _ck(q, None)
+            if not _cget(ck):
+                vec = await embed(q)                   # caches embedding
+                chunks = await search_qdrant(vec)      # fetch context
+                ctx = context_str(chunks)
+                model = pick_model(q)
+                msgs = build_messages(ctx, [], q)
+                resp = await oai().chat.completions.create(
+                    model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.1,
+                )
+                result = {
+                    "answer":      resp.choices[0].message.content,
+                    "model":       model,
+                    "chunks_used": len(chunks),
+                    "elapsed_s":   0.0,
+                    "sources":     [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
+                }
+                _cset(ck, result)
+        except Exception:
+            pass
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    asyncio.create_task(_preload())
+    yield
+    # Cleanup: close persistent HTTP client
+    global _http
+    if _http and not _http.is_closed:
+        await _http.aclose()
+
+# ═══════════════════════════════════════════════════════════════
 #  FASTAPI APP
 # ═══════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Dalilak AI API", version="4.0.0")
+app = FastAPI(title="Dalilak AI API", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -438,10 +549,16 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════════
 
 async def embed(text: str) -> list:
+    ek = _ek(text)
+    cached_vec = _emget(ek)
+    if cached_vec is not None:
+        return cached_vec
     r = await oai().embeddings.create(
         model=EMBED_MODEL, input=[text[:MAX_CHARS]], dimensions=VECTOR_DIM,
     )
-    return r.data[0].embedding
+    vec = r.data[0].embedding
+    _emset(ek, vec)
+    return vec
 
 async def search_qdrant(vec: list, domain: Optional[str] = None) -> list:
     body: dict = {
@@ -450,8 +567,7 @@ async def search_qdrant(vec: list, domain: Optional[str] = None) -> list:
     }
     if domain:
         body["filter"] = {"must": [{"key": "domain", "match": {"value": domain}}]}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(
+    r = await http().post(
             f"{qdrant_url()}/collections/{COLLECTION}/points/search",
             headers=qdrant_headers(), json=body,
         )
