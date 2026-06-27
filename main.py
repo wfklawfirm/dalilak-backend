@@ -76,12 +76,12 @@ EMBED_MODEL    = "text-embedding-3-large"
 VECTOR_DIM     = 3072
 MODEL_FAST     = "gpt-4o-mini"
 MODEL_SMART    = "gpt-4o"
-MIN_SCORE      = 0.28
-MAX_CTX        = 12
-MAX_TOKENS     = 2000
+MIN_SCORE      = 0.26
+MAX_CTX        = 15
+MAX_TOKENS     = 3200
 MAX_HISTORY    = 6
-MAX_CHARS      = 12000
-MAX_DOC_TOKENS = 3500
+MAX_CHARS      = 16000
+MAX_DOC_TOKENS = 4000
 
 # Auth config
 JWT_SECRET   = os.environ.get("JWT_SECRET", "dalilak-secret-CHANGE-IN-PROD")
@@ -473,22 +473,34 @@ async def search_qdrant(vec: list, domain: Optional[str] = None) -> list:
 def context_str(chunks: list) -> str:
     if not chunks:
         return ""
-    parts = ["=== المعلومات المتاحة ==="]
+    parts = ["=== قاعدة البيانات — المعلومات ذات الصلة ==="]
     for i, c in enumerate(chunks, 1):
         parts.append(f"\n[{i}] {c['title']}")
-        if c["ministry"]: parts.append(f"الجهة: {c['ministry']}")
+        if c.get("ministry"):       parts.append(f"الجهة المختصة: {c['ministry']}")
+        if c.get("category"):       parts.append(f"القطاع: {c['category']}")
         parts.append(c["text"])
-        if c["website"]:  parts.append(f"الموقع: {c['website']}")
-        if c["phone"]:    parts.append(f"الهاتف: {c['phone']}")
+        if c.get("fees"):           parts.append(f"الرسوم: {c['fees']}")
+        if c.get("processing_time"):parts.append(f"مدة الإنجاز: {c['processing_time']}")
+        if c.get("website"):        parts.append(f"الموقع: {c['website']}")
+        if c.get("phone"):          parts.append(f"الهاتف: {c['phone']}")
         parts.append("---")
     return "\n".join(parts)
 
 def pick_model(msg: str) -> str:
-    keywords = ["نموذج", "وثيقة", "خطوات", "إجراءات", "اشرح", "مقارن", "form", "document"]
-    return MODEL_SMART if any(k in msg for k in keywords) or len(msg) > 200 else MODEL_FAST
+    # Use fast model only for very short greetings/simple queries
+    simple = ["مرحبا", "أهلا", "شكرا", "hello", "hi", "كيفك", "كيف حالك"]
+    if len(msg) < 30 and any(s in msg.lower() for s in simple):
+        return MODEL_FAST
+    return MODEL_SMART  # gpt-4o for all real questions
 
 def build_messages(ctx: str, history: list, user_msg: str) -> list:
-    system = SYSTEM_PROMPT + (f"\n\n{ctx}" if ctx else "")
+    legal_reminder = """
+\n\n⚡ تعليمات إلزامية لهذه الإجابة:
+1. اذكر المواد القانونية والمراسيم ذات الصلة في قسم "📚 الأساس القانوني"
+2. كن دقيقاً وشاملاً — لا تحذف خطوة أو وثيقة
+3. درجة الحرارة صفر — لا تخترع أي معلومة غير موجودة في السياق أو في معرفتك المؤكدة
+4. اختم بـ ⚠️ إذا كانت هناك شروط استثنائية أو تحذيرات مهمة"""
+    system = SYSTEM_PROMPT + legal_reminder + (f"\n\n{ctx}" if ctx else "")
     msgs = [{"role": "system", "content": system}]
     for m in history[-MAX_HISTORY:]:
         msgs.append({"role": m.role, "content": m.content})
@@ -862,7 +874,7 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     msgs   = build_messages(ctx, req.history, req.message)
 
     resp = await oai().chat.completions.create(
-        model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.3,
+        model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.1,
     )
     elapsed_ms = int((time.time() - t0) * 1000)
     result = {
@@ -894,7 +906,7 @@ async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
             yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
             stream = await oai().chat.completions.create(
-                model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.3, stream=True,
+                model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.1, stream=True,
             )
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content
@@ -991,7 +1003,7 @@ async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_u
 
             stream = await oai().chat.completions.create(
                 model=MODEL_SMART, messages=msgs, max_tokens=MAX_DOC_TOKENS,
-                temperature=0.2, stream=True,
+                temperature=0.1, stream=True,
             )
             async for chunk in stream:
                 delta = chunk.choices[0].delta.content
