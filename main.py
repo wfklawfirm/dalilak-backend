@@ -1317,6 +1317,118 @@ async def startup():
                 "last_login":      None,
             })
 
+# ── Document Upload Stubs (Phase 8) ──────────────────────────────────────────
+# TODO: Replace stubs with real storage (S3/Cloudflare R2) + PDF extraction
+
+class UploadDocumentRequest(BaseModel):
+    file_base64: str
+    file_name: str
+    file_type: str  # "application/pdf", "application/msword", "image/jpeg", etc.
+    user_note: Optional[str] = None
+
+class DeleteDocumentRequest(BaseModel):
+    doc_id: str
+
+@app.post("/documents/upload")
+async def upload_document(req: UploadDocumentRequest, user: dict = Depends(get_current_user)):
+    """STUB: Accept a base64-encoded file, return a document ID. Replace with real storage."""
+    import uuid, base64
+    try:
+        _ = base64.b64decode(req.file_base64)  # validate base64
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 content")
+    doc_id = str(uuid.uuid4())
+    return {
+        "success": True,
+        "doc_id": doc_id,
+        "file_name": req.file_name,
+        "file_type": req.file_type,
+        "message": "STUB: Document received. Storage not yet implemented.",
+        # TODO: Store in R2/S3, extract text via PyPDF2 or Textract, index in Qdrant
+    }
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
+    """STUB: Delete a stored document by ID."""
+    return {
+        "success": True,
+        "doc_id": doc_id,
+        "message": "STUB: Deletion acknowledged. Storage not yet implemented.",
+    }
+
+@app.get("/documents")
+async def list_documents(user: dict = Depends(get_current_user)):
+    """STUB: List documents uploaded by the current user."""
+    return {
+        "documents": [],
+        "message": "STUB: Document listing not yet implemented.",
+    }
+
+
+# ── Feedback Endpoint (Phase 10) ──────────────────────────────────────────────
+
+class FeedbackRequest(BaseModel):
+    question: str
+    answer: str
+    rating: str  # "up" or "down"
+    confidence: Optional[str] = None
+    sources: Optional[list] = None
+
+@app.post("/feedback")
+async def submit_feedback(req: FeedbackRequest, user: dict = Depends(get_current_user)):
+    """Store user feedback (thumbs up/down) on AI responses."""
+    if req.rating not in ("up", "down"):
+        raise HTTPException(status_code=400, detail="rating must be 'up' or 'down'")
+    try:
+        from qdrant_client.models import PointStruct
+        import uuid, time
+        payload = {
+            "type": "feedback",
+            "username": user.get("username", "unknown"),
+            "question": req.question[:500],
+            "answer": req.answer[:1000],
+            "rating": req.rating,
+            "confidence": req.confidence,
+            "timestamp": int(time.time()),
+        }
+        client.upsert(
+            collection_name="dalilak_logs",
+            points=[PointStruct(id=str(uuid.uuid4()), vector=[0.0] * 3072, payload=payload)]
+        )
+    except Exception as e:
+        logger.warning(f"Feedback store failed: {e}")
+    return {"success": True}
+
+
+# ── Admin Feedback Review (Phase 10) ─────────────────────────────────────────
+
+@app.get("/admin/feedback")
+async def get_feedback(limit: int = 50, rating: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Return recent feedback entries. Admin only."""
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        filt = Filter(must=[
+            FieldCondition(key="type", match=MatchValue(value="feedback")),
+        ])
+        if rating in ("up", "down"):
+            filt.must.append(FieldCondition(key="rating", match=MatchValue(value=rating)))
+        results = client.scroll(
+            collection_name="dalilak_logs",
+            scroll_filter=filt,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        entries = [p.payload for p in results[0]]
+        entries.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return {"feedback": entries, "total": len(entries)}
+    except Exception as e:
+        logger.error(f"Feedback fetch failed: {e}")
+        return {"feedback": [], "total": 0, "error": str(e)}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
