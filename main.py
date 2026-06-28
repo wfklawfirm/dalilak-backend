@@ -2468,6 +2468,186 @@ async def export_checklist(req: ChecklistExportRequest, user: dict = Depends(get
     })
 
 
+# ═══════════════════════════════════════════════════════════════
+#  SERVICE GROUPS — Phase 6
+#  JSON-backed repository. No DB required.
+# ═══════════════════════════════════════════════════════════════
+
+_SERVICE_GROUPS_DATA = [
+    {
+        "id": "sg-1", "slug": "expat", "priority": 1,
+        "titleAr": "معاملات المغتربين", "titleEn": "Expat Services",
+        "icon": "✈️", "color": "#1E40AF",
+        "descriptionAr": "إنجاز معاملات لبنانية من الخارج عبر السفارات والتوكيل",
+        "descriptionEn": "Complete Lebanese procedures from abroad via embassies or power of attorney",
+        "services": [
+            {"id":"si-1-1","slug":"poa-from-abroad","groupSlug":"expat","titleAr":"وكالة من الخارج","titleEn":"Power of Attorney from Abroad","icon":"📜","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["expat","lawyer"],"procedureSlug":"power-of-attorney"},
+            {"id":"si-1-2","slug":"property-sale-abroad","groupSlug":"expat","titleAr":"بيع عقار من الخارج","titleEn":"Property Sale from Abroad","icon":"🏠","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["expat","lawyer"]},
+            {"id":"si-1-3","slug":"document-attestation","groupSlug":"expat","titleAr":"تصديق مستندات","titleEn":"Document Attestation","icon":"🔏","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["expat","citizen","lawyer"],"procedureSlug":"document-attestation"},
+            {"id":"si-1-4","slug":"register-abroad","groupSlug":"expat","titleAr":"تسجيل زواج أو ولادة من الخارج","titleEn":"Register Marriage/Birth from Abroad","icon":"📋","defaultAction":"start_flow","verificationStatus":"partially_verified","availableFor":["expat"]},
+            {"id":"si-1-5","slug":"track-via-agent","groupSlug":"expat","titleAr":"متابعة معاملة عبر وكيل","titleEn":"Track Procedure via Agent","icon":"🔄","defaultAction":"ask_ai","verificationStatus":"draft","availableFor":["expat"]},
+        ],
+    },
+    {
+        "id": "sg-2", "slug": "property", "priority": 2,
+        "titleAr": "العقارات", "titleEn": "Property Transactions",
+        "icon": "🏛️", "color": "#854D0E",
+        "descriptionAr": "بيع وشراء وتسجيل العقارات والحصول على الإفادات العقارية",
+        "descriptionEn": "Buy, sell, register property and obtain real estate certificates",
+        "services": [
+            {"id":"si-2-1","slug":"property-sale","groupSlug":"property","titleAr":"بيع عقار","titleEn":"Property Sale","icon":"🏠","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","expat","lawyer"],"procedureSlug":"property-transfer"},
+            {"id":"si-2-2","slug":"property-certificate","groupSlug":"property","titleAr":"إفادة عقارية","titleEn":"Property Certificate","icon":"📋","defaultAction":"ask_ai","verificationStatus":"verified","availableFor":["citizen","lawyer"]},
+            {"id":"si-2-3","slug":"debt-clearance","groupSlug":"property","titleAr":"براءة ذمة","titleEn":"Debt Clearance","icon":"✅","defaultAction":"ask_ai","verificationStatus":"partially_verified","availableFor":["citizen","lawyer"]},
+            {"id":"si-2-4","slug":"property-tax","groupSlug":"property","titleAr":"ضريبة العقار والرسوم","titleEn":"Property Tax & Fees","icon":"💰","defaultAction":"ask_ai","verificationStatus":"partially_verified","availableFor":["citizen","lawyer","company"]},
+            {"id":"si-2-5","slug":"inheritance-property","groupSlug":"property","titleAr":"عقار ضمن إرث","titleEn":"Inherited Property","icon":"⚖️","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","lawyer"]},
+            {"id":"si-2-6","slug":"poa-sale","groupSlug":"property","titleAr":"وكالة للبيع","titleEn":"Power of Attorney for Sale","icon":"📜","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","expat","lawyer"],"procedureSlug":"power-of-attorney"},
+        ],
+    },
+    {
+        "id": "sg-3", "slug": "contracts", "priority": 3,
+        "titleAr": "العقود", "titleEn": "Contracts",
+        "icon": "📝", "color": "#7C3AED",
+        "descriptionAr": "تحليل العقود وكشف الثغرات ومراجعة البنود قبل التوقيع",
+        "descriptionEn": "Analyze contracts, detect gaps, and review clauses before signing",
+        "services": [
+            {"id":"si-3-1","slug":"lease-review","groupSlug":"contracts","titleAr":"تحليل عقد إيجار","titleEn":"Lease Contract Review","icon":"🔍","defaultAction":"upload_document","requiresDocument":True,"verificationStatus":"verified","availableFor":["citizen","expat","lawyer","company"]},
+            {"id":"si-3-2","slug":"contract-gaps","groupSlug":"contracts","titleAr":"كشف الثغرات والمخاطر","titleEn":"Gap & Risk Detection","icon":"⚠️","defaultAction":"upload_document","requiresDocument":True,"verificationStatus":"verified","availableFor":["citizen","lawyer","company"]},
+            {"id":"si-3-3","slug":"missing-clauses","groupSlug":"contracts","titleAr":"البنود الناقصة","titleEn":"Missing Clauses","icon":"✏️","defaultAction":"upload_document","requiresDocument":True,"verificationStatus":"verified","availableFor":["citizen","lawyer","company"]},
+            {"id":"si-3-4","slug":"obligations-map","groupSlug":"contracts","titleAr":"التزامات كل طرف","titleEn":"Party Obligations Map","icon":"📊","defaultAction":"upload_document","requiresDocument":True,"verificationStatus":"verified","availableFor":["citizen","lawyer","company"]},
+            {"id":"si-3-5","slug":"signing-checklist","groupSlug":"contracts","titleAr":"Checklist قبل التوقيع","titleEn":"Pre-Signing Checklist","icon":"✅","defaultAction":"generate_checklist","verificationStatus":"verified","availableFor":["citizen","expat","lawyer","company"]},
+        ],
+    },
+    {
+        "id": "sg-4", "slug": "civil-records", "priority": 4,
+        "titleAr": "الأحوال الشخصية والقيود", "titleEn": "Civil Records",
+        "icon": "👨‍👩‍👦", "color": "#065F46",
+        "descriptionAr": "استخراج وثائق الأحوال الشخصية وقيود السجل المدني",
+        "descriptionEn": "Extract civil status documents and registry records",
+        "services": [
+            {"id":"si-4-1","slug":"civil-extract","groupSlug":"civil-records","titleAr":"إخراج قيد","titleEn":"Civil Registry Extract","icon":"📋","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","expat"],"procedureSlug":"civil-registry-extract"},
+            {"id":"si-4-2","slug":"criminal-record","groupSlug":"civil-records","titleAr":"سجل عدلي","titleEn":"Criminal Record","icon":"📌","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","expat"],"procedureSlug":"criminal-record"},
+            {"id":"si-4-3","slug":"birth-cert","groupSlug":"civil-records","titleAr":"شهادة ميلاد","titleEn":"Birth Certificate","icon":"👶","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","expat"],"procedureSlug":"birth-certificate"},
+            {"id":"si-4-4","slug":"marriage-cert","groupSlug":"civil-records","titleAr":"وثيقة زواج","titleEn":"Marriage Certificate","icon":"💍","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","expat"],"procedureSlug":"marriage-registration"},
+            {"id":"si-4-5","slug":"inheritance-cert","groupSlug":"civil-records","titleAr":"حصر إرث","titleEn":"Inheritance Certificate","icon":"⚖️","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["citizen","lawyer"],"procedureSlug":"inheritance-certificate"},
+        ],
+    },
+    {
+        "id": "sg-5", "slug": "business", "priority": 5,
+        "titleAr": "الشركات والأعمال", "titleEn": "Business & Companies",
+        "icon": "🏭", "color": "#9D174D",
+        "descriptionAr": "تأسيس الشركات والتراخيص التجارية والضمان الاجتماعي",
+        "descriptionEn": "Company formation, commercial licenses, and social security",
+        "services": [
+            {"id":"si-5-1","slug":"company-formation","groupSlug":"business","titleAr":"تأسيس شركة","titleEn":"Company Formation","icon":"🏭","defaultAction":"start_flow","verificationStatus":"verified","availableFor":["company","lawyer","citizen"],"procedureSlug":"company-registration"},
+            {"id":"si-5-2","slug":"commercial-registry","groupSlug":"business","titleAr":"السجل التجاري","titleEn":"Commercial Registry","icon":"📋","defaultAction":"ask_ai","verificationStatus":"verified","availableFor":["company","lawyer"]},
+            {"id":"si-5-3","slug":"business-tax","groupSlug":"business","titleAr":"ضريبة وإلتزامات الشركات","titleEn":"Corporate Tax & Obligations","icon":"💰","defaultAction":"ask_ai","verificationStatus":"partially_verified","availableFor":["company","accountant"]},
+            {"id":"si-5-4","slug":"social-security-reg","groupSlug":"business","titleAr":"الضمان الاجتماعي","titleEn":"Social Security","icon":"🏥","defaultAction":"ask_ai","verificationStatus":"verified","availableFor":["company","citizen"],"procedureSlug":"social-security"},
+        ],
+    },
+    {
+        "id": "sg-6", "slug": "forms-docs", "priority": 6,
+        "titleAr": "النماذج والمستندات", "titleEn": "Forms & Documents",
+        "icon": "📄", "color": "#374151",
+        "descriptionAr": "البحث عن نماذج رسمية وتحليل المستندات وتوليد مسودات",
+        "descriptionEn": "Find official forms, analyze documents, and generate drafts",
+        "services": [
+            {"id":"si-6-1","slug":"find-form","groupSlug":"forms-docs","titleAr":"البحث عن نموذج","titleEn":"Find a Form","icon":"🔍","defaultAction":"ask_ai","verificationStatus":"verified","availableFor":["citizen","expat","lawyer","company","service_office"]},
+            {"id":"si-6-2","slug":"analyze-document","groupSlug":"forms-docs","titleAr":"تحليل مستند","titleEn":"Analyze Document","icon":"🔎","defaultAction":"upload_document","requiresDocument":True,"verificationStatus":"verified","availableFor":["citizen","expat","lawyer","company"]},
+            {"id":"si-6-3","slug":"detect-missing","groupSlug":"forms-docs","titleAr":"كشف النواقص","titleEn":"Detect Missing Items","icon":"⚠️","defaultAction":"upload_document","requiresDocument":True,"verificationStatus":"verified","availableFor":["citizen","lawyer"]},
+            {"id":"si-6-4","slug":"download-checklist","groupSlug":"forms-docs","titleAr":"تحميل Checklist","titleEn":"Download Checklist","icon":"✅","defaultAction":"generate_checklist","verificationStatus":"verified","availableFor":["citizen","expat","lawyer","company"]},
+            {"id":"si-6-5","slug":"generate-draft","groupSlug":"forms-docs","titleAr":"توليد مسودة","titleEn":"Generate Draft","icon":"✏️","defaultAction":"ask_ai","verificationStatus":"draft","availableFor":["citizen","lawyer","company"]},
+        ],
+    },
+]
+
+class ServiceStartRequest(BaseModel):
+    user_type: Optional[str] = None
+    context: Optional[str] = None
+
+
+@app.get("/service-groups")
+async def get_service_groups():
+    """Return all service groups with their services."""
+    return {"groups": _SERVICE_GROUPS_DATA}
+
+
+@app.get("/service-groups/{slug}")
+async def get_service_group(slug: str):
+    """Return a single service group by slug."""
+    group = next((g for g in _SERVICE_GROUPS_DATA if g["slug"] == slug), None)
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Service group '{slug}' not found")
+    return group
+
+
+@app.get("/services/{slug}")
+async def get_service_item(slug: str):
+    """Return a single service item by slug."""
+    for group in _SERVICE_GROUPS_DATA:
+        for svc in group["services"]:
+            if svc["slug"] == slug:
+                return {**svc, "group": {k: v for k, v in group.items() if k != "services"}}
+    raise HTTPException(status_code=404, detail=f"Service '{slug}' not found")
+
+
+@app.post("/services/{slug}/start")
+async def start_service(slug: str, req: ServiceStartRequest, user: dict = Depends(get_current_user)):
+    """
+    Start a service journey. Returns routing instructions:
+    - guided_flow: trigger the GuidedFlow wizard with a pre-selected procedure
+    - upload_document: prompt the user to upload a document
+    - ask_ai: pre-fill the chat input with a context-aware prompt
+    - generate_checklist: generate and return a checklist prompt
+    """
+    for group in _SERVICE_GROUPS_DATA:
+        for svc in group["services"]:
+            if svc["slug"] == slug:
+                action = svc["defaultAction"]
+                prompt_ar = None
+                if action == "ask_ai":
+                    prompt_ar = f"أريد معلومات عن: {svc['titleAr']}"
+                elif action == "generate_checklist":
+                    prompt_ar = f"أعطني checklist شامل لـ: {svc['titleAr']}"
+                elif action == "upload_document":
+                    prompt_ar = f"قم بتحليل المستند المرفوع بخصوص: {svc['titleAr']}"
+                return {
+                    "service": svc,
+                    "action": action,
+                    "procedureSlug": svc.get("procedureSlug"),
+                    "requiresDocument": svc.get("requiresDocument", False),
+                    "chatPrompt": prompt_ar,
+                    "userId": user.get("username"),
+                }
+    raise HTTPException(status_code=404, detail=f"Service '{slug}' not found")
+
+
+# ── Human Review Request ──────────────────────────────────────────────────────
+
+class HumanReviewRequest(BaseModel):
+    transaction_id: Optional[str] = None
+    document_ids: list[str] = []
+    request_type: str = "general"  # contract_review | document_review | property | lawyer | pre_signing
+    summary: Optional[str] = None
+    urgency: str = "normal"  # normal | high | critical
+
+
+@app.post("/human-review/request")
+async def request_human_review(req: HumanReviewRequest, user: dict = Depends(get_current_user)):
+    """
+    Log a human review request.
+    TODO: integrate with CRM / notification service.
+    """
+    review_id = str(uuid.uuid4())[:8]
+    return {
+        "review_id": review_id,
+        "status": "received",
+        "message_ar": "تم استلام طلب المراجعة. سيتواصل معك فريق دليلك AI خلال 24–48 ساعة.",
+        "message_en": "Review request received. The Dalilak AI team will contact you within 24–48 hours.",
+        "estimated_response": "24–48h",
+        "user": user.get("username"),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
