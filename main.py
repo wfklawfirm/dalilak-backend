@@ -460,7 +460,7 @@ class ChatRequest(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     file_base64: str = Field(..., max_length=25_000_000)  # ~18 MB raw
-    file_type: str = Field(..., max_length=50)
+    file_type: str = Field(..., max_length=200)           # OOXML types can be 70+ chars
     file_name: str = Field(..., max_length=255)
     message: str = Field(default="حلل هذه الوثيقة واقترح الإجراءات المناسبة", max_length=500)
     history: list[Message] = Field(default=[], max_length=20)
