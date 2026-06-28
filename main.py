@@ -702,6 +702,15 @@ async def search_qdrant(vec: list, domain: Optional[str] = None) -> list:
 
 # Patterns by question type (Arabic + English)
 _PATTERNS = {
+    'draft': re.compile(
+        r'حضّر|حضر\s|أعد\s|اعد\s|اكتب\s|اكتبي\s|اصغ|صِغ|صغ\s|انشئ|أنشئ|ضع\s|ضعي\s|'
+        r'اعطني\s+مسودة|اعطيني\s+مسودة|أعطني\s+مسودة|'
+        r'مسودة\s|نموذج\s+طلب|نموذج\s+رسالة|'
+        r'إنذار\s+بالإخلاء|انذار\s+بالاخلاء|طلب\s+إخلاء|طلب\s+اخلاء|'
+        r'رسالة\s+رسمية|طلب\s+رسمي|وكالة\s+قانونية|'
+        r'عقد\s+إيجار|عقد\s+بيع|محضر\s+تسليم|اتفاقية|تعهد\s+خطي|'
+        r'إقرار\s+بالاستلام|براءة\s+ذمة|'
+        r'draft\s|prepare a|write a|draw up|compose a', re.I),
     'comparative': re.compile(
         r'فرق|مقارنة|أفضل|أحسن|أسرع|أرخص|بدلاً|عوضاً|difference|compare|vs\b|versus|better|'
         r'أم\s|ام\s|أو\s.*\sأو', re.I),
@@ -725,7 +734,7 @@ _MULTI_SPLIT = re.compile(r'[،,؛;]\s*|\bو(أيضاً|كذلك|أيضا)?\b|\b
 def classify_query(msg: str) -> dict:
     """
     Returns:
-      type       : 'comparative' | 'legal' | 'eligibility' | 'procedural' | 'factual' | 'general'
+      type       : 'draft' | 'comparative' | 'legal' | 'eligibility' | 'procedural' | 'factual' | 'general'
       multipart  : bool — question has ≥2 distinct sub-questions
       complexity : 0-10 — drives model choice and retrieval depth
     """
@@ -808,6 +817,20 @@ def rerank_chunks(chunks: list[dict], query: str) -> list[dict]:
 def type_hint(qinfo: dict) -> str:
     """Inject type-specific answering instructions into the system prompt."""
     hints = {
+        'draft':       "\n\n✍️ نوع الطلب: **إعداد مسودة** — تعليمات إلزامية:\n"
+                       "1. **أنشئ المسودة فوراً** — لا تشرح الإجراءات، اكتب النص الكامل للوثيقة مباشرة\n"
+                       "2. ابدأ بـ: ═══════════════════════════════\n"
+                       "            مسودة أولية — [نوع الوثيقة]\n"
+                       "            ═══════════════════════════════\n"
+                       "3. استخدم صيغة رسمية قانونية مناسبة للقانون اللبناني\n"
+                       "4. ضع [الاسم الكامل] أو [التاريخ] أو [العنوان] كـ placeholder لأي بيانات ناقصة\n"
+                       "5. تضمّن جميع البنود والصياغات القانونية اللازمة لصحة الوثيقة\n"
+                       "6. أنهِ المسودة بـ:\n"
+                       "            ─────────────────────────────\n"
+                       "            نهاية المسودة\n"
+                       "            ─────────────────────────────\n"
+                       "7. أضف بعدها فقرة قصيرة: 'ملاحظة: هذه مسودة أولية للإرشاد فقط. يُنصح بمراجعة محامٍ مرخّص قبل الاستخدام الرسمي.'\n"
+                       "8. لا تضمن نتائج قانونية. لا تخترع أرقاماً أو جهات رسمية.",
         'procedural':  "\n\n📋 نوع السؤال: **إجرائي** — الإجابة الإلزامية:\n"
                        "  • ابدأ بنظرة عامة من جملتين\n"
                        "  • اذكر المستندات المطلوبة في قائمة\n"
