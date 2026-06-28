@@ -3253,6 +3253,205 @@ async def generate_draft(
     }
 
 
+
+# ══ PHASE 2: PROCEDURE FLOWCHARTS ═══════════════════════════════════════════
+
+_FLOWCHART_SEED = {
+    "property-sale": {
+        "procedureSlug": "property-sale",
+        "titleAr": "بيع عقار",
+        "titleEn": "Property Sale",
+        "country": "lebanon",
+        "version": "1.0",
+        "verificationStatus": "partially_verified",
+        "estimatedDurationAr": "4-8 أسابيع",
+        "estimatedDurationEn": "4-8 weeks",
+        "nodes": [
+            {"id":"start","type":"start","titleAr":"بداية معاملة بيع العقار","titleEn":"Start Property Sale","status":"current"},
+            {"id":"docs","type":"document","titleAr":"تجهيز المستندات","titleEn":"Prepare Documents","status":"not_started","descriptionAr":"سند الملكية، هوية البائع والمشتري، مخطط العقار","requiredDocuments":["سند الملكية","هوية شخصية","مخطط العقار","قيد عائلي"]},
+            {"id":"notary","type":"authority","titleAr":"مراجعة الكاتب العدل","titleEn":"Visit Notary","status":"not_started","relatedAuthority":"notary-public"},
+            {"id":"contract","type":"action","titleAr":"إبرام عقد البيع","titleEn":"Sign Sale Contract","status":"not_started","riskLevel":"high"},
+            {"id":"risk_check","type":"risk","titleAr":"تحقق من بند الضمان","titleEn":"Verify Guarantee Clause","status":"not_started","descriptionAr":"تأكد من وجود بند الضمان وعدم وجود رهون"},
+            {"id":"registry","type":"authority","titleAr":"التسجيل في السجل العقاري","titleEn":"Register in Land Registry","status":"not_started","relatedAuthority":"real-estate-registry"},
+            {"id":"fees","type":"action","titleAr":"دفع رسوم التسجيل","titleEn":"Pay Registration Fees","status":"not_started"},
+            {"id":"completion","type":"completion","titleAr":"اكتمال النقل","titleEn":"Transfer Complete","status":"not_started"}
+        ],
+        "edges": [
+            {"id":"e1","from":"start","to":"docs"},
+            {"id":"e2","from":"docs","to":"notary"},
+            {"id":"e3","from":"notary","to":"contract"},
+            {"id":"e4","from":"contract","to":"risk_check"},
+            {"id":"e5","from":"risk_check","to":"registry","labelAr":"بعد التحقق"},
+            {"id":"e6","from":"registry","to":"fees"},
+            {"id":"e7","from":"fees","to":"completion"}
+        ]
+    },
+    "power-of-attorney": {
+        "procedureSlug": "power-of-attorney",
+        "titleAr": "وكالة قانونية",
+        "titleEn": "Power of Attorney",
+        "country": "lebanon",
+        "version": "1.0",
+        "verificationStatus": "partially_verified",
+        "estimatedDurationAr": "1-3 أيام",
+        "estimatedDurationEn": "1-3 days",
+        "nodes": [
+            {"id":"start","type":"start","titleAr":"بداية إجراء الوكالة","titleEn":"Start POA","status":"current"},
+            {"id":"scope","type":"question","titleAr":"تحديد صلاحيات الوكالة","titleEn":"Define POA Scope","descriptionAr":"هل هي وكالة بيع؟ متابعة معاملة؟ قبض؟"},
+            {"id":"draft","type":"draft","titleAr":"إعداد نص الوكالة","titleEn":"Draft POA Text","descriptionAr":"يُنصح بصياغتها من محامٍ","riskLevel":"medium"},
+            {"id":"risk","type":"risk","titleAr":"مراجعة الصلاحيات","titleEn":"Review Scope Risk","descriptionAr":"وكالة مفتوحة تحمل مخاطر عالية"},
+            {"id":"notary","type":"authority","titleAr":"التوقيع أمام الكاتب العدل","titleEn":"Sign Before Notary","relatedAuthority":"notary-public"},
+            {"id":"abroad","type":"question","titleAr":"هل الوكيل خارج لبنان؟","titleEn":"Attorney Abroad?"},
+            {"id":"apostille","type":"action","titleAr":"تصديق وزارة الخارجية","titleEn":"Foreign Affairs Apostille"},
+            {"id":"completion","type":"completion","titleAr":"الوكالة جاهزة","titleEn":"POA Ready"}
+        ],
+        "edges": [
+            {"id":"e1","from":"start","to":"scope"},
+            {"id":"e2","from":"scope","to":"draft"},
+            {"id":"e3","from":"draft","to":"risk"},
+            {"id":"e4","from":"risk","to":"notary","labelAr":"بعد المراجعة"},
+            {"id":"e5","from":"notary","to":"abroad"},
+            {"id":"e6","from":"abroad","to":"apostille","labelAr":"نعم"},
+            {"id":"e7","from":"abroad","to":"completion","labelAr":"لا"},
+            {"id":"e8","from":"apostille","to":"completion"}
+        ]
+    }
+}
+
+def _generic_flowchart(slug: str) -> dict:
+    return {
+        "procedureSlug": slug, "titleAr": "إجراء", "titleEn": "Procedure",
+        "country": "lebanon", "version": "1.0", "verificationStatus": "draft",
+        "nodes": [
+            {"id":"start","type":"start","titleAr":"بداية الإجراء","titleEn":"Start","status":"current"},
+            {"id":"docs","type":"document","titleAr":"تجهيز المستندات","titleEn":"Prepare Documents","status":"not_started"},
+            {"id":"authority","type":"authority","titleAr":"مراجعة الجهة المختصة","titleEn":"Visit Authority","status":"not_started"},
+            {"id":"submit","type":"action","titleAr":"تقديم الطلب","titleEn":"Submit Request","status":"not_started"},
+            {"id":"completion","type":"completion","titleAr":"اكتمال المعاملة","titleEn":"Complete","status":"not_started"},
+        ],
+        "edges": [
+            {"id":"e1","from":"start","to":"docs"},{"id":"e2","from":"docs","to":"authority"},
+            {"id":"e3","from":"authority","to":"submit"},{"id":"e4","from":"submit","to":"completion"}
+        ]
+    }
+
+@app.get("/procedures/{slug}/flowchart")
+async def get_procedure_flowchart(slug: str, user: dict = Depends(get_current_user)):
+    return _FLOWCHART_SEED.get(slug) or _generic_flowchart(slug)
+
+# ══ PHASE 6: TRANSACTION COMPLETION SCORE ══════════════════════════════════
+
+class CompletionScoreRequest(BaseModel):
+    transaction_id: Optional[str] = None
+    uploaded_doc_count: int = 0
+    required_doc_count: int = 0
+    has_missing_critical: bool = False
+    risk_level: str = "low"
+    procedure_slug: Optional[str] = None
+
+@app.post("/transactions/completion-score")
+async def get_completion_score(req: CompletionScoreRequest, user: dict = Depends(get_current_user)):
+    doc_score = min(100, int((req.uploaded_doc_count / max(req.required_doc_count, 1)) * 100))
+    risk_penalty = {"low": 0, "medium": 10, "high": 25, "critical": 40}.get(req.risk_level, 0)
+    critical_penalty = 30 if req.has_missing_critical else 0
+    overall = max(0, min(100, doc_score - risk_penalty - critical_penalty))
+    if overall >= 80: status = "ready_for_review"
+    elif overall >= 50: status = "partially_ready"
+    else: status = "not_ready"
+    return {
+        "transactionId": req.transaction_id or "temp", "score": overall, "status": status,
+        "missingCriticalItems": [],
+        "blockingIssues": (["مستندات إلزامية ناقصة"] if req.has_missing_critical else []),
+        "recommendedNextAction": "أكمل رفع المستندات المطلوبة" if overall < 80 else "راجع الملف مع محامٍ",
+        "breakdown": {"documentsScore": doc_score, "dataScore": 70, "consistencyScore": 80, "riskScore": max(0, 100 - risk_penalty)}
+    }
+
+# ══ PHASE 9: AUTOPILOT SCAFFOLD ════════════════════════════════════════════
+
+class AutopilotStartRequest(BaseModel):
+    procedure_slug: str
+    language: str = "ar"
+
+@app.post("/autopilot/start")
+async def autopilot_start(req: AutopilotStartRequest, user: dict = Depends(get_current_user)):
+    return {
+        "sessionId": str(uuid.uuid4())[:8], "procedureSlug": req.procedure_slug,
+        "status": "waiting_answer", "currentStepIndex": 0, "totalSteps": 5,
+        "answers": {}, "uploadedDocIds": [],
+        "nextQuestion": {"questionAr": "ما هو هدفك من هذه المعاملة؟", "questionEn": "What is your goal?", "key": "goal", "type": "text"}
+    }
+
+@app.post("/autopilot/{session_id}/answer")
+async def autopilot_answer(session_id: str, body: dict = {}, user: dict = Depends(get_current_user)):
+    return {"sessionId": session_id, "status": "waiting_answer", "message": "تم تسجيل إجابتك — ميزة قيد التطوير"}
+
+# ══ PHASE 10: AUTHORITY DIRECTORY ══════════════════════════════════════════
+
+_AUTHORITY_DATA = [
+    {"slug":"ministry-of-justice","nameAr":"وزارة العدل","nameEn":"Ministry of Justice","country":"lebanon","type":"ministry","proceduresHandled":["inheritance","civil-record","judicial"],"formsLinked":[],"confidence":"high","website":"https://justice.gov.lb"},
+    {"slug":"real-estate-registry","nameAr":"دائرة السجل العقاري","nameEn":"Real Estate Registry","country":"lebanon","type":"registry","proceduresHandled":["property-sale","property-registration"],"formsLinked":[],"confidence":"high"},
+    {"slug":"notary-public","nameAr":"الكاتب العدل","nameEn":"Notary Public","country":"lebanon","type":"notary","proceduresHandled":["power-of-attorney","contract-notarization","sale-contract"],"formsLinked":[],"confidence":"high"},
+    {"slug":"ministry-of-finance","nameAr":"وزارة المالية","nameEn":"Ministry of Finance","country":"lebanon","type":"ministry","proceduresHandled":["tax-registration","company-formation","vat"],"formsLinked":[],"confidence":"high","website":"https://finance.gov.lb"},
+    {"slug":"civil-registry","nameAr":"دائرة النفوس","nameEn":"Civil Registry","country":"lebanon","type":"registry","proceduresHandled":["civil-record","birth-registration","marriage-registration","name-change"],"formsLinked":[],"confidence":"high"},
+    {"slug":"ministry-of-foreign-affairs","nameAr":"وزارة الخارجية","nameEn":"Ministry of Foreign Affairs","country":"lebanon","type":"ministry","proceduresHandled":["document-certification","apostille","expat-consular"],"formsLinked":[],"confidence":"high","website":"https://www.foreign.gov.lb"},
+    {"slug":"commercial-registry","nameAr":"السجل التجاري","nameEn":"Commercial Registry","country":"lebanon","type":"registry","proceduresHandled":["company-formation","company-dissolution","company-amendment"],"formsLinked":[],"confidence":"high"},
+]
+
+@app.get("/authorities")
+async def list_authorities(country: Optional[str] = None, user: dict = Depends(get_current_user)):
+    data = [a for a in _AUTHORITY_DATA if not country or a.get("country") == country or a.get("country") == "both"]
+    return {"authorities": data, "total": len(data)}
+
+@app.get("/authorities/{slug}")
+async def get_authority_detail(slug: str, user: dict = Depends(get_current_user)):
+    found = next((a for a in _AUTHORITY_DATA if a["slug"] == slug), None)
+    if not found:
+        from fastapi import HTTPException as _HTTPException
+        raise _HTTPException(404, "Authority not found")
+    return found
+
+# ══ PHASE 12: HUMAN REVIEW ══════════════════════════════════════════════════
+
+class HumanReviewCreateRequest(BaseModel):
+    request_type: str = "general"
+    urgency: str = "normal"
+    summary: str
+    transaction_id: Optional[str] = None
+    document_ids: list[str] = []
+
+@app.post("/human-review/request")
+async def create_human_review(req: HumanReviewCreateRequest, user: dict = Depends(get_current_user)):
+    return {
+        "id": str(uuid.uuid4())[:8], "userId": user.get("username"),
+        "requestType": req.request_type, "urgency": req.urgency,
+        "summary": req.summary, "status": "pending",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "message": "تم استلام طلب المراجعة. سيتواصل معك فريقنا خلال 24-48 ساعة.",
+        "transactionId": req.transaction_id,
+    }
+
+@app.get("/human-review/requests")
+async def list_human_reviews(user: dict = Depends(get_current_user)):
+    return {"requests": [], "message": "Human review marketplace coming soon"}
+
+# ══ PHASE 17: SHARE PACKAGE ════════════════════════════════════════════════
+
+class SharePackageRequest(BaseModel):
+    type: str = "checklist"
+    title_ar: str
+    title_en: str = ""
+    transaction_id: Optional[str] = None
+
+@app.post("/share/package")
+async def create_share_package(req: SharePackageRequest, user: dict = Depends(get_current_user)):
+    return {
+        "shareId": str(uuid.uuid4())[:12], "type": req.type,
+        "titleAr": req.title_ar, "expiresAt": None,
+        "message": "⚠️ مشاركة الملفات قيد التطوير — احفظ في مساحة العمل في الوقت الحالي"
+    }
+
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
