@@ -2648,6 +2648,588 @@ async def request_human_review(req: HumanReviewRequest, user: dict = Depends(get
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# UNIVERSAL DOCUMENT INTELLIGENCE ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Configurable document-type → draft templates map ─────────────────────────
+
+_DOCUMENT_DRAFTS_MAP: dict = {
+    "contract": [
+        "eviction-notice", "rent-payment-notice", "repair-request",
+        "deposit-return-request", "contract-addendum", "final-settlement",
+        "property-handover",
+    ],
+    "property": [
+        "property-statement-req", "municipal-clearance-req", "property-sale-poa",
+        "property-sale-checklist", "lawyer-referral-letter", "docs-handover-report",
+    ],
+    "notarial": [
+        "poa-scope-review", "poa-amendment-request", "follow-up-poa",
+        "notary-letter", "agent-letter", "poa-validity-checklist",
+        "property-sale-poa",
+    ],
+    "civil_status": [
+        "civil-record-request", "event-registration-req", "record-correction-req",
+        "doc-certification-req", "civil-checklist", "mukhtar-letter",
+        "inheritance-checklist", "inheritance-request", "heirs-letter",
+        "heirs-docs-table",
+    ],
+    "company": [
+        "commercial-registry-req", "board-resolution", "tax-ministry-letter",
+        "tax-registration-req", "nssf-registration-req", "company-setup-checklist",
+    ],
+    "tax": [
+        "tax-assessment-objection", "tax-clearance-req", "installment-request",
+        "tax-docs-checklist", "tax-ministry-letter",
+    ],
+    "judicial": [
+        "notice-reply", "extension-request", "legal-objection",
+        "lawyer-review-request", "case-summary", "legal-docs-checklist",
+    ],
+    "administrative": [
+        "admin-objection", "review-request", "transaction-follow-up",
+        "reminder-letter", "admin-complaint", "admin-review-checklist",
+    ],
+    "expat_consular": [
+        "consular-poa", "certification-request", "consulate-letter",
+        "expat-checklist", "local-agent-letter", "expat-transaction-file",
+    ],
+}
+
+# ── Draft template catalogue (titles + metadata) ──────────────────────────────
+
+_DRAFT_CATALOGUE: dict = {
+    "eviction-notice":         {"ar": "إنذار بالإخلاء",                     "en": "Eviction Notice",              "lawyer": True},
+    "rent-payment-notice":     {"ar": "إنذار بدفع بدلات الإيجار",            "en": "Rent Payment Notice",          "lawyer": False},
+    "repair-request":          {"ar": "طلب إصلاحات",                         "en": "Repair Request Letter",        "lawyer": False},
+    "deposit-return-request":  {"ar": "طلب إعادة التأمين",                   "en": "Deposit Return Request",       "lawyer": False},
+    "contract-addendum":       {"ar": "ملحق تعديل عقد",                      "en": "Contract Addendum",            "lawyer": False},
+    "final-settlement":        {"ar": "مخالصة نهائية",                       "en": "Final Settlement Receipt",     "lawyer": False},
+    "property-handover":       {"ar": "محضر تسليم مأجور/عقار",               "en": "Property Handover Report",     "lawyer": False},
+    "property-statement-req":  {"ar": "طلب إفادة عقارية",                    "en": "Property Statement Request",   "lawyer": False},
+    "municipal-clearance-req": {"ar": "طلب براءة ذمة بلدية",                 "en": "Municipal Clearance Request",  "lawyer": False},
+    "property-sale-poa":       {"ar": "وكالة بيع عقار",                      "en": "Property Sale POA",            "lawyer": True},
+    "property-sale-checklist": {"ar": "Checklist بيع عقار",                  "en": "Property Sale Checklist",      "lawyer": False},
+    "lawyer-referral-letter":  {"ar": "رسالة إلى محامٍ",                     "en": "Attorney Referral Letter",     "lawyer": False},
+    "docs-handover-report":    {"ar": "محضر تسليم مستندات عقارية",            "en": "Property Docs Handover",       "lawyer": False},
+    "poa-scope-review":        {"ar": "مراجعة صلاحيات الوكالة",              "en": "POA Scope Review",             "lawyer": False},
+    "poa-amendment-request":   {"ar": "طلب تعديل وكالة",                     "en": "POA Amendment Request",        "lawyer": True},
+    "follow-up-poa":           {"ar": "وكالة متابعة معاملة",                 "en": "Follow-up POA",                "lawyer": False},
+    "notary-letter":           {"ar": "كتاب إلى كاتب عدل",                   "en": "Notary Letter",                "lawyer": False},
+    "agent-letter":            {"ar": "رسالة إلى الوكيل",                    "en": "Letter to Agent",              "lawyer": False},
+    "poa-validity-checklist":  {"ar": "Checklist صلاحية وكالة",              "en": "POA Validity Checklist",       "lawyer": False},
+    "civil-record-request":    {"ar": "طلب إخراج قيد",                       "en": "Civil Record Request",         "lawyer": False},
+    "event-registration-req":  {"ar": "طلب تسجيل واقعة",                     "en": "Event Registration Request",   "lawyer": False},
+    "record-correction-req":   {"ar": "طلب تصحيح قيد",                       "en": "Record Correction Request",    "lawyer": False},
+    "doc-certification-req":   {"ar": "طلب تصديق مستند",                     "en": "Document Certification Request","lawyer": False},
+    "civil-checklist":         {"ar": "Checklist معاملة نفوس",               "en": "Civil Status Checklist",       "lawyer": False},
+    "mukhtar-letter":          {"ar": "رسالة إلى مختار أو دائرة نفوس",       "en": "Letter to Mukhtar / Registry", "lawyer": False},
+    "inheritance-checklist":   {"ar": "Checklist حصر إرث",                   "en": "Inheritance Checklist",        "lawyer": False},
+    "inheritance-request":     {"ar": "طلب حصر إرث",                         "en": "Inheritance Petition",         "lawyer": True},
+    "heirs-letter":            {"ar": "رسالة إلى الورثة",                    "en": "Letter to Heirs",              "lawyer": False},
+    "heirs-docs-table":        {"ar": "جدول مستندات الورثة",                 "en": "Heirs Documents Table",        "lawyer": False},
+    "commercial-registry-req": {"ar": "طلب سجل تجاري",                       "en": "Commercial Registry Request",  "lawyer": False},
+    "board-resolution":        {"ar": "محضر جمعية / قرار شركاء",             "en": "Board Resolution",             "lawyer": False},
+    "tax-ministry-letter":     {"ar": "كتاب إلى وزارة المالية",              "en": "Letter to Ministry of Finance","lawyer": False},
+    "tax-registration-req":    {"ar": "طلب تسجيل ضريبي",                     "en": "Tax Registration Request",     "lawyer": False},
+    "nssf-registration-req":   {"ar": "طلب تسجيل ضمان",                      "en": "NSSF Registration Request",    "lawyer": False},
+    "company-setup-checklist": {"ar": "Checklist تأسيس شركة",                "en": "Company Setup Checklist",      "lawyer": False},
+    "tax-assessment-objection":{"ar": "اعتراض على تكليف أو غرامة",           "en": "Tax Assessment Objection",     "lawyer": True},
+    "tax-clearance-req":       {"ar": "طلب براءة ذمة",                       "en": "Tax Clearance Request",        "lawyer": False},
+    "installment-request":     {"ar": "طلب تقسيط",                           "en": "Installment Request",          "lawyer": False},
+    "tax-docs-checklist":      {"ar": "Checklist مستندات ضريبية",            "en": "Tax Documents Checklist",      "lawyer": False},
+    "notice-reply":            {"ar": "جواب على إنذار",                      "en": "Notice Reply",                 "lawyer": True},
+    "extension-request":       {"ar": "طلب مهلة",                            "en": "Extension Request",            "lawyer": False},
+    "legal-objection":         {"ar": "كتاب اعتراض",                         "en": "Legal Objection Letter",       "lawyer": True},
+    "lawyer-review-request":   {"ar": "طلب مراجعة محامٍ",                   "en": "Request Legal Review",         "lawyer": False},
+    "case-summary":            {"ar": "ملخص ملف قضائي",                      "en": "Case File Summary",            "lawyer": False},
+    "legal-docs-checklist":    {"ar": "Checklist للمستندات القانونية",        "en": "Legal Documents Checklist",    "lawyer": False},
+    "admin-objection":         {"ar": "اعتراض إداري",                        "en": "Administrative Objection",     "lawyer": False},
+    "review-request":          {"ar": "طلب إعادة نظر",                       "en": "Reconsideration Request",      "lawyer": False},
+    "transaction-follow-up":   {"ar": "طلب متابعة معاملة",                   "en": "Transaction Follow-up Request","lawyer": False},
+    "reminder-letter":         {"ar": "كتاب تذكير",                          "en": "Reminder Letter",              "lawyer": False},
+    "admin-complaint":         {"ar": "شكوى إدارية",                         "en": "Administrative Complaint",     "lawyer": False},
+    "admin-review-checklist":  {"ar": "Checklist للمراجعة",                  "en": "Review Checklist",             "lawyer": False},
+    "consular-poa":            {"ar": "وكالة من الخارج",                     "en": "Consular Power of Attorney",   "lawyer": False},
+    "certification-request":   {"ar": "طلب تصديق",                           "en": "Certification Request",        "lawyer": False},
+    "consulate-letter":        {"ar": "رسالة إلى القنصلية",                  "en": "Consulate Letter",             "lawyer": False},
+    "expat-checklist":         {"ar": "Checklist تصديق وترجمة",              "en": "Certification & Translation Checklist","lawyer": False},
+    "local-agent-letter":      {"ar": "رسالة إلى وكيل داخل لبنان/سوريا",    "en": "Letter to Local Agent",        "lawyer": False},
+    "expat-transaction-file":  {"ar": "ملف متابعة معاملة مغترب",             "en": "Expat Transaction File",       "lawyer": False},
+}
+
+# ── GPT-4o Prompt for Universal Document Analysis ────────────────────────────
+
+_UNIVERSAL_ANALYSIS_SYSTEM = """
+أنت محلل مستندات قانوني وإداري متخصص في المعاملات اللبنانية والسورية.
+مهمتك تحليل المستند المرفوع وإعادة بيانات منظّمة بصيغة JSON صارمة.
+
+قواعد حاسمة:
+- لا تخترع معلومات. إذا لم تجد بياناً فاذكر "غير محدد" أو اترك القيمة فارغة.
+- لا تخترع مواعيد أو رسوم أو متطلبات رسمية.
+- كل تفسير غير موثّق ضعه في "ai_inferred".
+- لا تضمن نتائج قانونية.
+- إذا كان المستند غير واضح فقل ذلك في confidence.
+
+أعد JSON فقط، بدون أي نص خارجه.
+"""
+
+_UNIVERSAL_ANALYSIS_USER = """
+حلّل المستند التالي وأعد JSON دقيق يتبع هذا الهيكل بالضبط:
+
+{{
+  "documentType": {{
+    "category": "<contract|property|civil_status|notarial|company|tax|judicial|administrative|expat_consular|unknown>",
+    "subtype": "<نوع فرعي مثل: عقد إيجار / وكالة بيع / إخراج قيد فردي ...>",
+    "confidence": "<high|medium|low>"
+  }},
+  "detectedCountry": "<lebanon|syria|both|unknown>",
+  "detectedLanguage": "<ar|en|fr|mixed|unknown>",
+  "extractedFacts": [
+    {{"label": "...", "value": "...", "normalizedKey": "...", "confidence": "high|medium|low", "sourceExcerpt": "..."}}
+  ],
+  "relatedProcedures": [
+    {{"procedureSlug": "...", "titleAr": "...", "titleEn": "...", "relevance": "high|medium|low", "reason": "..."}}
+  ],
+  "possibleUses": [
+    {{"titleAr": "...", "titleEn": "...", "descriptionAr": "...", "relatedProcedureSlug": "..."}}
+  ],
+  "missingInformation": [
+    {{"field": "...", "whyItMatters": "...", "requiredFor": "...", "priority": "low|medium|high|critical"}}
+  ],
+  "missingDocuments": [
+    {{"titleAr": "...", "titleEn": "...", "reason": "...", "priority": "low|medium|high|critical", "status": "missing|unclear|needs_review"}}
+  ],
+  "risks": [
+    {{"title": "...", "level": "low|medium|high|critical", "explanation": "...", "recommendedAction": "..."}}
+  ],
+  "recommendedDraftSlugs": ["slug1", "slug2"],
+  "nextActions": [
+    {{"labelAr": "...", "labelEn": "...", "actionType": "<create_transaction_file|generate_checklist|generate_draft|upload_missing_document|start_guided_flow|ask_followup|request_human_review|compare_with_template|none>", "priority": "primary|secondary"}}
+  ],
+  "evidence": [
+    {{"claim": "...", "sourceType": "user_uploaded_document|official|internal|ai_inferred|unknown", "sourceTitle": "...", "excerpt": "...", "verified": false, "reliability": "high|medium|low"}}
+  ],
+  "confidence": {{
+    "extraction": "high|medium|low",
+    "procedureMatching": "high|medium|low",
+    "legalInterpretation": "high|medium|low",
+    "overall": "high|medium|low",
+    "reason": "..."
+  }}
+}}
+
+للمجالات الفارغة أو الغير قابلة للتحديد: استخدم [] أو "" أو "unknown".
+
+المستند:
+---
+{document_text}
+---
+
+اسم الملف: {filename}
+"""
+
+
+# ── DocumentIntelligenceService ───────────────────────────────────────────────
+
+class DocumentIntelligenceService:
+    """
+    Universal document analysis service.
+    Uses GPT-4o to classify, extract facts, match procedures, detect risks,
+    and recommend drafts for any legal/administrative document.
+    """
+
+    def __init__(self, client):
+        self.client = client
+
+    async def analyze(
+        self,
+        document_text: str,
+        filename: str,
+        document_id: str,
+    ) -> dict:
+        """
+        Full analysis pipeline:
+        1. Classify document
+        2. Extract facts
+        3. Match procedures
+        4. Detect risks
+        5. Recommend drafts
+        6. Build next actions
+        """
+        if not document_text or not document_text.strip():
+            return self._empty_analysis(document_id, filename)
+
+        # Truncate to ~6000 chars to stay well within GPT-4o context
+        truncated = document_text[:6000]
+        if len(document_text) > 6000:
+            truncated += "\n\n[... المستند مقتطع للتحليل ...]"
+
+        prompt = _UNIVERSAL_ANALYSIS_USER.format(
+            document_text=truncated,
+            filename=filename,
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": _UNIVERSAL_ANALYSIS_SYSTEM},
+                    {"role": "user",   "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=2500,
+            )
+            raw = response.choices[0].message.content or "{}"
+            gpt_data = json.loads(raw)
+        except Exception as e:
+            logger.warning(f"Document intelligence GPT call failed: {e}")
+            return self._empty_analysis(document_id, filename, error=str(e))
+
+        # Enrich recommended drafts from slugs
+        draft_slugs = gpt_data.get("recommendedDraftSlugs", [])
+        recommended_drafts = self._build_draft_recommendations(
+            draft_slugs,
+            gpt_data.get("documentType", {}).get("category", "unknown"),
+        )
+
+        # Build disclaimer
+        disclaimer = (
+            "هذا التحليل إرشادي فقط استناداً إلى المستند المرفوع وقاعدة معرفة دليلك AI. "
+            "لا يُعدّ استشارة قانونية رسمية. تأكد من المتطلبات الفعلية من الجهة المختصة "
+            "أو من محامٍ مرخّص قبل اتخاذ أي إجراء."
+        )
+
+        return {
+            "kind": "universal_document_analysis",
+            "documentId": document_id,
+            "fileName": filename,
+            "documentType": gpt_data.get("documentType", {"category": "unknown", "confidence": "low"}),
+            "detectedCountry": gpt_data.get("detectedCountry", "unknown"),
+            "detectedLanguage": gpt_data.get("detectedLanguage", "unknown"),
+            "extractedFacts": gpt_data.get("extractedFacts", []),
+            "relatedProcedures": gpt_data.get("relatedProcedures", []),
+            "possibleUses": gpt_data.get("possibleUses", []),
+            "missingInformation": gpt_data.get("missingInformation", []),
+            "missingDocuments": gpt_data.get("missingDocuments", []),
+            "risks": gpt_data.get("risks", []),
+            "recommendedDrafts": recommended_drafts,
+            "nextActions": gpt_data.get("nextActions", self._default_next_actions()),
+            "evidence": gpt_data.get("evidence", []),
+            "confidence": gpt_data.get("confidence", {
+                "extraction": "low", "procedureMatching": "low",
+                "legalInterpretation": "low", "overall": "low",
+            }),
+            "disclaimer": disclaimer,
+        }
+
+    def _build_draft_recommendations(self, slugs: list, category: str) -> list:
+        """Convert slug list + category into full draft recommendation objects."""
+        # Merge GPT-suggested slugs with category defaults
+        category_defaults = _DOCUMENT_DRAFTS_MAP.get(category, [])
+        all_slugs = list(dict.fromkeys(slugs + category_defaults))[:8]  # dedupe, cap at 8
+
+        drafts = []
+        for slug in all_slugs:
+            meta = _DRAFT_CATALOGUE.get(slug)
+            if not meta:
+                continue
+            drafts.append({
+                "templateSlug": slug,
+                "titleAr": meta["ar"],
+                "titleEn": meta["en"],
+                "category": self._infer_draft_category(slug),
+                "recommendedBecause": f"مناسب لنوع المستند ({category}) وما تم استخراجه",
+                "requiresLawyerReview": meta["lawyer"],
+                "requiredFields": [],
+            })
+        return drafts
+
+    def _infer_draft_category(self, slug: str) -> str:
+        if "checklist" in slug or "list" in slug: return "checklist"
+        if "notice" in slug or "إنذار" in slug:   return "notice"
+        if "request" in slug or "req" in slug:    return "request"
+        if "objection" in slug or "اعتراض" in slug: return "objection"
+        if "letter" in slug or "كتاب" in slug:    return "administrative_letter"
+        if "poa" in slug or "وكالة" in slug:      return "declaration"
+        if "settlement" in slug:                   return "settlement"
+        if "addendum" in slug:                     return "contract_addendum"
+        return "form_draft"
+
+    def _default_next_actions(self) -> list:
+        return [
+            {"labelAr": "إنشاء ملف معاملة", "labelEn": "Create Transaction File",
+             "actionType": "create_transaction_file", "priority": "primary"},
+            {"labelAr": "إنشاء Checklist", "labelEn": "Generate Checklist",
+             "actionType": "generate_checklist", "priority": "primary"},
+            {"labelAr": "طلب مراجعة بشرية", "labelEn": "Request Human Review",
+             "actionType": "request_human_review", "priority": "secondary"},
+        ]
+
+    def _empty_analysis(self, document_id: str, filename: str, error: str = "") -> dict:
+        return {
+            "kind": "universal_document_analysis",
+            "documentId": document_id,
+            "fileName": filename,
+            "documentType": {"category": "unknown", "confidence": "low"},
+            "detectedCountry": "unknown",
+            "detectedLanguage": "unknown",
+            "extractedFacts": [],
+            "relatedProcedures": [],
+            "possibleUses": [],
+            "missingInformation": [],
+            "missingDocuments": [],
+            "risks": [],
+            "recommendedDrafts": [],
+            "nextActions": self._default_next_actions(),
+            "evidence": [],
+            "confidence": {
+                "extraction": "low", "procedureMatching": "low",
+                "legalInterpretation": "low", "overall": "low",
+                "reason": error or "لم يتم العثور على محتوى قابل للتحليل",
+            },
+            "disclaimer": "تعذّر تحليل المستند. تأكد من صحة الملف وحاول مرة أخرى.",
+        }
+
+
+# Singleton service instance (reuses the global openai_client)
+_doc_intelligence_service: Optional[DocumentIntelligenceService] = None
+
+
+def get_doc_intelligence() -> DocumentIntelligenceService:
+    global _doc_intelligence_service
+    if _doc_intelligence_service is None:
+        _doc_intelligence_service = DocumentIntelligenceService(openai_client)
+    return _doc_intelligence_service
+
+
+# ── Universal Analysis Request Models ────────────────────────────────────────
+
+class UniversalAnalysisRequest(BaseModel):
+    document_text: str
+    filename: str = "document"
+    document_id: Optional[str] = None
+
+
+class DraftGenerateRequest(BaseModel):
+    template_slug: str
+    document_id: Optional[str] = None
+    transaction_id: Optional[str] = None
+    related_procedure_slug: Optional[str] = None
+    language: str = "ar"
+    extracted_facts: Optional[dict] = None
+    user_inputs: Optional[dict] = None
+    redaction_mode: str = "none"
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post("/documents/universal-analysis")
+async def universal_document_analysis(
+    req: UniversalAnalysisRequest,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Full universal analysis of any uploaded document.
+    Classifies, extracts facts, matches procedures, detects risks, recommends drafts.
+    """
+    doc_id = req.document_id or str(uuid.uuid4())[:8]
+    svc = get_doc_intelligence()
+    result = await svc.analyze(req.document_text, req.filename, doc_id)
+    result["requestedBy"] = user.get("username")
+    return result
+
+
+@app.post("/documents/{document_id}/match-procedures")
+async def match_document_procedures(
+    document_id: str,
+    req: UniversalAnalysisRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Return only the procedure matches for a document."""
+    svc = get_doc_intelligence()
+    result = await svc.analyze(req.document_text, req.filename, document_id)
+    return {
+        "documentId": document_id,
+        "relatedProcedures": result.get("relatedProcedures", []),
+        "possibleUses": result.get("possibleUses", []),
+    }
+
+
+@app.post("/documents/{document_id}/missing-requirements")
+async def document_missing_requirements(
+    document_id: str,
+    req: UniversalAnalysisRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Return only missing fields + missing documents for a given document."""
+    svc = get_doc_intelligence()
+    result = await svc.analyze(req.document_text, req.filename, document_id)
+    return {
+        "documentId": document_id,
+        "missingInformation": result.get("missingInformation", []),
+        "missingDocuments":   result.get("missingDocuments", []),
+    }
+
+
+@app.post("/documents/{document_id}/recommended-drafts")
+async def document_recommended_drafts(
+    document_id: str,
+    req: UniversalAnalysisRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Return recommended drafts for a document."""
+    svc = get_doc_intelligence()
+    result = await svc.analyze(req.document_text, req.filename, document_id)
+    return {
+        "documentId": document_id,
+        "recommendedDrafts": result.get("recommendedDrafts", []),
+    }
+
+
+@app.get("/drafts/templates")
+async def list_draft_templates(
+    category: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """List all available draft templates, optionally filtered by document category."""
+    templates = []
+    for slug, meta in _DRAFT_CATALOGUE.items():
+        applicable = [
+            cat for cat, slugs in _DOCUMENT_DRAFTS_MAP.items() if slug in slugs
+        ]
+        if category and category not in applicable:
+            continue
+        templates.append({
+            "slug": slug,
+            "titleAr": meta["ar"],
+            "titleEn": meta["en"],
+            "requiresLawyerReview": meta["lawyer"],
+            "applicableDocCategories": applicable,
+        })
+    return {"templates": templates, "total": len(templates)}
+
+
+@app.get("/drafts/templates/{slug}")
+async def get_draft_template(
+    slug: str,
+    user: dict = Depends(get_current_user),
+):
+    """Get a single draft template by slug."""
+    meta = _DRAFT_CATALOGUE.get(slug)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Template '{slug}' not found")
+    applicable = [cat for cat, slugs in _DOCUMENT_DRAFTS_MAP.items() if slug in slugs]
+    return {
+        "slug": slug,
+        "titleAr": meta["ar"],
+        "titleEn": meta["en"],
+        "requiresLawyerReview": meta["lawyer"],
+        "applicableDocCategories": applicable,
+    }
+
+
+@app.post("/drafts/generate")
+async def generate_draft(
+    req: DraftGenerateRequest,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Generate a draft document using GPT-4o.
+    Pre-fills from extracted facts and user inputs.
+    Marks output clearly as a preliminary draft.
+    """
+    meta = _DRAFT_CATALOGUE.get(req.template_slug)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Template '{req.template_slug}' not found")
+
+    title = meta["ar"] if req.language == "ar" else meta["en"]
+    requires_lawyer = meta["lawyer"]
+
+    # Build context from facts + user inputs
+    facts_str = ""
+    if req.extracted_facts:
+        facts_str = "\n".join(f"{k}: {v}" for k, v in req.extracted_facts.items() if v)
+    inputs_str = ""
+    if req.user_inputs:
+        inputs_str = "\n".join(f"{k}: {v}" for k, v in req.user_inputs.items() if v)
+
+    lang_instruction = "باللغة العربية الرسمية" if req.language == "ar" else "in formal English"
+
+    system_prompt = (
+        "أنت محرر قانوني متخصص في إعداد مسودات الوثائق القانونية والإدارية اللبنانية. "
+        "مهمتك صياغة مسودات أولية واضحة ومنظّمة. "
+        "تأكد دائماً من وضع عبارة 'مسودة أولية' في أعلى الوثيقة. "
+        "استخدم [PLACEHOLDER] لأي بيانات غير متوفرة. "
+        "لا تخترع معلومات. لا تضمن نتائج قانونية."
+    )
+
+    user_prompt = f"""أعد مسودة "{title}" {lang_instruction}.
+
+البيانات المتوفرة من المستند:
+{facts_str or "(لا يوجد)"}
+
+بيانات إضافية من المستخدم:
+{inputs_str or "(لا يوجد)"}
+
+متطلبات التنسيق:
+- ابدأ بـ: ═══ مسودة أولية | {title} ═══
+- نهاية الوثيقة: ─── نهاية المسودة ───
+- استخدم [PLACEHOLDER] لكل بيان ناقص
+- أضف في الأسفل: "ملاحظة: هذه مسودة أولية صادرة عن دليلك AI وليست وثيقة رسمية."
+{"- أضف: 'يوصى بمراجعة محامٍ مرخّص قبل استعمال هذه المسودة.'" if requires_lawyer else ""}
+"""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1500,
+        )
+        draft_text = response.choices[0].message.content or ""
+    except Exception as e:
+        logger.warning(f"Draft generation failed: {e}")
+        raise HTTPException(status_code=500, detail="فشل في توليد المسودة. حاول مرة أخرى.")
+
+    # Detect missing placeholders
+    import re
+    placeholders = re.findall(r'\[PLACEHOLDER[^\]]*\]', draft_text)
+
+    draft_id = str(uuid.uuid4())[:8]
+
+    return {
+        "draftId": draft_id,
+        "title": title,
+        "templateSlug": req.template_slug,
+        "language": req.language,
+        "draftText": draft_text,
+        "missingFields": placeholders,
+        "assumptions": [],
+        "warnings": (
+            ["يوصى بمراجعة محامٍ مرخّص قبل استعمال هذه المسودة."]
+            if requires_lawyer else []
+        ),
+        "requiresLawyerReview": requires_lawyer,
+        "sourceContext": {
+            "type": "internal_template",
+            "documentId": req.document_id,
+            "procedureSlug": req.related_procedure_slug,
+        },
+        "status": "needs_review" if requires_lawyer else "draft",
+        "disclaimer": (
+            "هذه مسودة أولية صادرة عن دليلك AI وليست وثيقة رسمية. "
+            "تأكد من صحة البيانات واستشر محامياً عند الحاجة."
+        ),
+        "requestedBy": user.get("username"),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
