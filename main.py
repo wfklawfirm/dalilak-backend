@@ -1565,56 +1565,8 @@ _ALLOWED_MIME_TYPES = {
     "image/tiff",
 }
 
-class UploadDocumentRequest(BaseModel):
-    file_base64: str
-    file_name: str
-    file_type: str  # MIME type — validated against allowlist
-    user_note: Optional[str] = None
-
-class DeleteDocumentRequest(BaseModel):
-    doc_id: str
-
-@app.post("/documents/upload")
-async def upload_document(req: UploadDocumentRequest, user: dict = Depends(get_current_user)):
-    """STUB: Accept a base64-encoded file, return a document ID. Replace with real storage."""
-    # Validate MIME type against allowlist
-    if req.file_type not in _ALLOWED_MIME_TYPES:
-        raise HTTPException(status_code=415, detail=f"نوع الملف غير مسموح به: {req.file_type}")
-    # Validate base64
-    try:
-        raw_bytes = base64.b64decode(req.file_base64)
-    except Exception:
-        raise HTTPException(status_code=400, detail="محتوى الملف غير صالح")
-    # Enforce 10MB limit
-    if len(raw_bytes) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="حجم الملف يتجاوز 10MB")
-    doc_id = str(uuid.uuid4())
-    return {
-        "success": True,
-        "doc_id": doc_id,
-        "file_name": req.file_name,
-        "file_type": req.file_type,
-        "size_bytes": len(raw_bytes),
-        "message": "STUB: Document received. Storage not yet implemented.",
-        # TODO: Store in R2/S3, extract text via PyPDF2 or Textract, index in Qdrant
-    }
-
-@app.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
-    """STUB: Delete a stored document by ID."""
-    return {
-        "success": True,
-        "doc_id": doc_id,
-        "message": "STUB: Deletion acknowledged. Storage not yet implemented.",
-    }
-
-@app.get("/documents")
-async def list_documents(user: dict = Depends(get_current_user)):
-    """STUB: List documents uploaded by the current user."""
-    return {
-        "documents": [],
-        "message": "STUB: Document listing not yet implemented.",
-    }
+# NOTE: UploadDocumentRequest, delete_document, list_documents are defined in
+# the DOCUMENT INTELLIGENCE section below (Phase 4/7/9) — real implementations.
 
 
 # ── Feedback Endpoint (Phase 10) ──────────────────────────────────────────────
