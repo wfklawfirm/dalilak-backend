@@ -1,0 +1,127 @@
+{
+  "version": "1.0",
+  "description": "Golden question set for Dalilak AI retrieval and answer quality evaluation",
+  "last_updated": "2024-01-01",
+  "questions": [
+    {
+      "id": "passport_001",
+      "category": "passport",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "كيف أستخرج جواز سفر لبناني؟",
+      "expected_procedure_slug": "passport",
+      "expected_keywords": ["جوازات السفر", "وزارة الداخلية", "الأمن العام", "هوية", "صور شخصية"],
+      "expected_authority": "الأمن العام اللبناني",
+      "expected_confidence_min": "medium",
+      "notes": "Core passport procedure — high traffic query"
+    },
+    {
+      "id": "passport_002",
+      "category": "passport",
+      "language": "en",
+      "country": "lebanon",
+      "question": "How do I renew my Lebanese passport from abroad?",
+      "expected_procedure_slug": "passport",
+      "expected_keywords": ["embassy", "consulate", "power of attorney", "General Security"],
+      "expected_authority": "Lebanese Embassy / General Security",
+      "expected_confidence_min": "medium",
+      "notes": "Expat passport renewal — common use case"
+    },
+    {
+      "id": "civil_001",
+      "category": "civil-record",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "كيف أحصل على إخراج قيد فردي؟",
+      "expected_procedure_slug": "civil-registry-extract",
+      "expected_keywords": ["نفوس", "قيد", "وزارة الداخلية", "مختار"],
+      "expected_authority": "دائرة النفوس",
+      "expected_confidence_min": "medium",
+      "notes": "Very common procedure"
+    },
+    {
+      "id": "inheritance_001",
+      "category": "inheritance",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "ما إجراءات حصر الإرث في لبنان؟",
+      "expected_procedure_slug": "inheritance-certificate",
+      "expected_keywords": ["إرث", "وراثة", "محكمة", "كاتب العدل", "وثيقة وفاة"],
+      "expected_authority": "المحكمة الشرعية أو المدنية",
+      "expected_confidence_min": "medium",
+      "notes": "Complex — multiple court types by religion"
+    },
+    {
+      "id": "company_001",
+      "category": "company-formation",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "كيف أسجل شركة SARL في لبنان؟",
+      "expected_procedure_slug": "company-registration",
+      "expected_keywords": ["سجل التجارة", "كاتب عدل", "وزارة العدل", "SARL", "رأس المال"],
+      "expected_authority": "وزارة العدل / سجل التجارة",
+      "expected_confidence_min": "medium",
+      "notes": "Business formation — critical for B2B users"
+    },
+    {
+      "id": "property_001",
+      "category": "property-transfer",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "ما خطوات نقل ملكية عقار في لبنان؟",
+      "expected_procedure_slug": "property-transfer",
+      "expected_keywords": ["عقارات", "كاتب عدل", "نقل ملكية", "رسوم تسجيل", "طابو"],
+      "expected_authority": "دائرة الشؤون العقارية",
+      "expected_confidence_min": "medium",
+      "notes": "High-value procedure"
+    },
+    {
+      "id": "expat_001",
+      "category": "expat-services",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "كيف يمكن للمغترب اللبناني في السعودية استخراج وثيقة رسمية؟",
+      "expected_procedure_slug": "expat-services",
+      "expected_keywords": ["سفارة", "قنصلية", "توكيل", "المغترب"],
+      "expected_authority": "السفارة اللبنانية",
+      "expected_confidence_min": "low",
+      "notes": "Expat services — less verified data available"
+    },
+    {
+      "id": "attestation_001",
+      "category": "document-attestation",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "كيف أصدّق شهادة جامعية للاستخدام في الخارج؟",
+      "expected_procedure_slug": "document-attestation",
+      "expected_keywords": ["تصديق", "وزارة الخارجية", "نوتر", "أبوستيل"],
+      "expected_authority": "وزارة الخارجية اللبنانية",
+      "expected_confidence_min": "medium",
+      "notes": "Document legalization / apostille chain"
+    },
+    {
+      "id": "criminal_001",
+      "category": "criminal-record",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "كيف أستخرج شهادة عدم محكومية من لبنان؟",
+      "expected_procedure_slug": "criminal-record",
+      "expected_keywords": ["سجل عدلي", "عدم محكومية", "وزارة العدل", "محاكم"],
+      "expected_authority": "وزارة العدل / المحاكم",
+      "expected_confidence_min": "medium",
+      "notes": "Required for work permits and visas"
+    },
+    {
+      "id": "building_001",
+      "category": "building-permit",
+      "language": "ar",
+      "country": "lebanon",
+      "question": "ما المستندات المطلوبة لاستخراج رخصة بناء؟",
+      "expected_procedure_slug": "building-permit",
+      "expected_keywords": ["رخصة بناء", "بلدية", "مهندس", "مخططات", "رقم العقار"],
+      "expected_authority": "البلدية المختصة",
+      "expected_confidence_min": "medium",
+      "notes": "Construction permits — municipal jurisdiction"
+    }
+  ]
+}
