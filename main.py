@@ -168,7 +168,7 @@ MODEL_SMART    = "gpt-4o"
 MIN_SCORE           = 0.28   # Qdrant retrieval floor (chunks below this are never returned)
 SUFFICIENCY_TOP_SCORE = 0.35  # Phase 5 gate: top chunk must reach this to proceed to GPT
 MAX_CTX        = 12
-MAX_TOKENS     = 2000
+MAX_TOKENS     = 3000
 MAX_HISTORY    = 6
 MAX_CHARS      = 12000
 MAX_DOC_TOKENS = 3500
@@ -751,6 +751,39 @@ async def _global_exception_handler(request: Request, exc: Exception):
         },
     )
 
+async def expand_query(query: str) -> str:
+    """
+    Lightweight query expansion: rewrite the user query to be more specific
+    for semantic search. Uses gpt-4o-mini to keep latency low (~200ms).
+    Only expands queries longer than 10 chars; returns original otherwise.
+    """
+    if len(query.strip()) <= 10:
+        return query
+    try:
+        resp = await asyncio.wait_for(
+            oai().chat.completions.create(
+                model=MODEL_FAST,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "أنت محرك بحث متخصص في الإجراءات الحكومية اللبنانية. "
+                            "أعد صياغة السؤال التالي في جملة بحثية واحدة أكثر دقةً وشمولاً، "
+                            "مُدرِجاً المصطلحات الرسمية المحتملة. أرجع الجملة فقط."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ],
+                max_tokens=150,
+                temperature=0.0,
+            ),
+            timeout=4.0,
+        )
+        expanded = resp.choices[0].message.content.strip()
+        return expanded if expanded else query
+    except Exception:
+        return query  # Graceful degradation: use original query on any failure
+
 async def embed(text: str) -> list:
     r = await oai().embeddings.create(
         model=EMBED_MODEL, input=[text[:MAX_CHARS]], dimensions=VECTOR_DIM,
@@ -784,22 +817,69 @@ async def search_qdrant(vec: list, domain: Optional[str] = None) -> list:
         for x in items
     ]
 
+def _mmr_deduplicate(chunks: list, k: int = 8, diversity: float = 0.3) -> list:
+    """
+    Maximal Marginal Relevance: keeps top-k chunks maximising relevance while
+    penalising chunks whose *title* duplicates an already-selected chunk.
+    diversity ∈ [0,1] — higher = more diverse, lower = more relevant.
+    """
+    if len(chunks) <= k:
+        return chunks
+    selected: list = []
+    remaining = list(chunks)
+    # Always take the best-scoring chunk first
+    best = max(remaining, key=lambda c: c["score"])
+    selected.append(best)
+    remaining.remove(best)
+    while len(selected) < k and remaining:
+        best_candidate, best_score = None, float("-inf")
+        for cand in remaining:
+            relevance = cand["score"]
+            # Penalty: 1.0 if same title as any selected, else 0
+            max_sim = max(
+                1.0 if sel["title"] and sel["title"] == cand["title"] else 0.0
+                for sel in selected
+            )
+            mmr = (1 - diversity) * relevance - diversity * max_sim
+            if mmr > best_score:
+                best_score = mmr
+                best_candidate = cand
+        if best_candidate:
+            selected.append(best_candidate)
+            remaining.remove(best_candidate)
+    return selected
+
+
 def context_str(chunks: list) -> str:
     if not chunks:
         return ""
-    parts = ["=== المعلومات المتاحة ==="]
+    # MMR deduplication for diverse, non-redundant context
+    chunks = _mmr_deduplicate(chunks, k=8)
+    parts = [
+        "=== المعلومات الرسمية المتاحة ===",
+        "استخدم أرقام المصادر [1] [2] ... في إجابتك للإشارة إلى المصدر.",
+    ]
     for i, c in enumerate(chunks, 1):
-        parts.append(f"\n[{i}] {c['title']}")
-        if c["ministry"]: parts.append(f"الجهة: {c['ministry']}")
+        header = f"\n[{i}] {c['title']}"
+        if c["ministry"]: header += f" — {c['ministry']}"
+        parts.append(header)
         parts.append(c["text"])
-        if c["website"]:  parts.append(f"الموقع: {c['website']}")
-        if c["phone"]:    parts.append(f"الهاتف: {c['phone']}")
-        parts.append("---")
+        extras = []
+        if c.get("website"): extras.append(f"🌐 {c['website']}")
+        if c.get("phone"):   extras.append(f"📞 {c['phone']}")
+        if c.get("fees"):    extras.append(f"💰 الرسوم: {c['fees']}")
+        if extras: parts.append("  ".join(extras))
+        parts.append(f"  (درجة التطابق: {c['score']:.0%})")
+        parts.append("─" * 40)
     return "\n".join(parts)
 
 def pick_model(msg: str) -> str:
-    keywords = ["نموذج", "وثيقة", "خطوات", "إجراءات", "اشرح", "مقارن", "form", "document"]
-    return MODEL_SMART if any(k in msg for k in keywords) or len(msg) > 200 else MODEL_FAST
+    """Use fast model only for very short greetings; always smart for real queries."""
+    greetings = {"مرحبا", "اهلا", "هلا", "hi", "hello", "مساء", "صباح", "شكرا", "شكراً", "تمام", "ok", "حسنا"}
+    msg_stripped = msg.strip().lower().rstrip("!.,?؟")
+    if len(msg) < 30 and msg_stripped in greetings:
+        return MODEL_FAST
+    return MODEL_SMART
 
 def build_messages(ctx: str, history: list, user_msg: str) -> list:
     system = SYSTEM_PROMPT + (f"\n\n{ctx}" if ctx else "")
@@ -1548,12 +1628,13 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
         return cached
 
     t0 = time.time()
-    vec    = await embed(req.message)
+    search_query = await expand_query(req.message)
+    vec    = await embed(search_query)
     chunks = await search_qdrant(vec, req.domain)
 
     # ── Phase 5 evidence gate (multi-factor v2) ──────────────────────────────
     outcome, gate_reason = _evaluate_evidence(chunks, req.message)
-    _log.info("[chat] evidence_gate outcome=%s reason=%s", outcome, gate_reason)
+    _log.info("[chat] evidence_gate outcome=%s reason=%s query_expanded=%s", outcome, gate_reason, search_query != req.message)
     if not _is_evidence_sufficient(chunks):
         return {"answer": SUFFICIENCY_MSG, "model": "gate", "chunks_used": 0,
                 "elapsed_s": round(time.time() - t0, 2), "sources": [], "gate": "INSUFFICIENT"}
@@ -1594,12 +1675,13 @@ async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(g
     async def generate() -> AsyncGenerator[str, None]:
         try:
             t0 = time.time()
-            vec    = await embed(req.message)
+            search_query = await expand_query(req.message)
+            vec    = await embed(search_query)
             chunks = await search_qdrant(vec, req.domain)
 
             # ── Phase 5 evidence gate (multi-factor v2) ───────────────────────
             outcome, gate_reason = _evaluate_evidence(chunks, req.message)
-            _log.info("[chat] evidence_gate outcome=%s reason=%s", outcome, gate_reason)
+            _log.info("[chat] evidence_gate outcome=%s reason=%s query_expanded=%s", outcome, gate_reason, search_query != req.message)
             if not _is_evidence_sufficient(chunks):
                 gate_ev = {"type": "gate", "answer": SUFFICIENCY_MSG, "sources": [], "gate": "INSUFFICIENT"}
                 yield f"data: {json.dumps(gate_ev, ensure_ascii=False)}\n\n"
