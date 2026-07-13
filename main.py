@@ -664,6 +664,10 @@ class AnalyzeRequest(BaseModel):
     message: str = "حلل هذه الوثيقة واقترح الإجراءات المناسبة"
     history: list[Message] = []
 
+class SuggestFollowupRequest(BaseModel):
+    question: str
+    answer: str
+
 class RegisterRequest(BaseModel):
     username: str
     email: str
@@ -1729,6 +1733,33 @@ async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(g
 
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/suggest_followup")
+async def suggest_followup(req: SuggestFollowupRequest, user: dict = Depends(get_current_user)):
+    """Generate 3 follow-up questions based on the Q&A exchange."""
+    prompt = (
+        f'السؤال الأصلي: "{req.question[:300]}"\n'
+        f'ملخص الإجابة: "{req.answer[:600]}"\n\n'
+        'اقترح 3 أسئلة متابعة قصيرة ومفيدة للمستخدم باللغة العربية، '
+        'تعمّق في جوانب مختلفة من الموضوع نفسه.\n'
+        'أجب بـ JSON فقط بهذا الشكل: {"questions": ["سؤال 1", "سؤال 2", "سؤال 3"]}'
+    )
+    try:
+        resp = await oai().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=180,
+            temperature=0.7,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        questions = data.get("questions", [])[:3]
+    except Exception as exc:
+        _log.warning("suggest_followup failed: %s", exc)
+        questions = []
+    return {"questions": questions}
+
 
 @app.post("/analyze/stream")
 async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_user)):
