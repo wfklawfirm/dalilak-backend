@@ -172,6 +172,11 @@ MAX_HISTORY    = 6
 MAX_CHARS      = 12000
 MAX_DOC_TOKENS = 3500
 
+# Phase 12 — Performance hardening: timeout ceilings for external calls
+QDRANT_TIMEOUT_SEC  = 10    # Qdrant vector search must complete within 10 s
+OPENAI_TIMEOUT_SEC  = 60    # OpenAI completions must complete within 60 s
+MAX_MESSAGE_LEN     = 4000  # Max chars in a single user message (prevents token flood)
+
 # Auth config
 JWT_SECRET   = os.environ.get("JWT_SECRET", "dalilak-secret-CHANGE-IN-PROD")
 JWT_ALGO     = "HS256"
@@ -1321,6 +1326,9 @@ async def admin_knowledge_extract(req: FileExtractRequest, admin: dict = Depends
 async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
     await _rate_enforce(request, "chat", user_id=user["username"])
     await _check_quota(user["username"], user.get("plan", "trial"))   # Phase 10
+    # Phase 12: reject oversized messages before any AI work
+    if len(req.message) > MAX_MESSAGE_LEN:
+        raise HTTPException(400, detail="الرسالة طويلة جداً — الحد الأقصى 4000 حرف")
     ck = _ck(req.message, req.domain)
     cached = _cget(ck)
     if cached:
@@ -1359,6 +1367,9 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
 async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
     await _rate_enforce(request, "chat", user_id=user["username"])
     await _check_quota(user["username"], user.get("plan", "trial"))   # Phase 10
+    # Phase 12: reject oversized messages before any AI work
+    if len(req.message) > MAX_MESSAGE_LEN:
+        raise HTTPException(400, detail="الرسالة طويلة جداً — الحد الأقصى 4000 حرف")
     async def generate() -> AsyncGenerator[str, None]:
         try:
             t0 = time.time()
