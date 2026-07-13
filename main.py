@@ -6,12 +6,14 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import secrets
 import sys
 import time
 import uuid
 from collections import OrderedDict
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Optional
 
@@ -19,7 +21,7 @@ import httpx
 import jwt as _jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -287,6 +289,21 @@ def _hash_reset_token(token: str) -> str:
     inbox only and is never persisted.
     """
     return hashlib.sha256(token.encode()).hexdigest()
+
+# ═══════════════════════════════════════════════════════════════
+#  PHASE 9 — OBSERVABILITY + PRIVACY
+# ═══════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [dalilak] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+)
+_log = logging.getLogger("dalilak")
+
+# Per-request correlation ID — propagated to X-Request-ID response header.
+# Never used to log user query content.
+_req_id_var: ContextVar[str] = ContextVar("req_id", default="-")
 
 # ═══════════════════════════════════════════════════════════════
 #  JWT HELPERS
@@ -578,9 +595,39 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-# ═══════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
 #  RAG HELPERS
 # ═══════════════════════════════════════════════════════════════
+
+# ── Phase 9: Request-ID middleware ────────────────────────────────────────────────────────────────────────────────
+# Attaches X-Request-ID to every response for client-side correlation.
+# Logs method + path + status + elapsed_ms — NEVER logs query text or tokens.
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or secrets.token_hex(8)
+    _req_id_var.set(rid)
+    t0 = time.time()
+    response = await call_next(request)
+    elapsed_ms = round((time.time() - t0) * 1000)
+    response.headers["X-Request-ID"] = rid
+    _log.info(
+        "rid=%s method=%s path=%s status=%s elapsed_ms=%s",
+        rid, request.method, request.url.path, response.status_code, elapsed_ms,
+    )
+    return response
+
+# ── Phase 9: Global exception handler — no stack traces to client ─────────────────────────────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    rid = _req_id_var.get("-")
+    _log.exception("unhandled exception rid=%s: %s", rid, type(exc).__name__)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "خطأ داخلي — حاول مجدداً أو تواصل مع الدعم الفني",
+            "req_id": rid,
+        },
+    )
 
 async def embed(text: str) -> list:
     r = await oai().embeddings.create(
@@ -677,7 +724,9 @@ async def health():
         pts = r.json().get("result", {}).get("points_count", 0)
         return {"status": "ok", "collection": COLLECTION, "points": pts}
     except Exception as e:
-        raise HTTPException(503, detail=str(e))
+        # Phase 9: log internally, never expose exception detail to client
+        _log.warning("health check failed: %s", e)
+        raise HTTPException(503, detail="خدمة البحث غير متوفرة مؤقتاً")
 
 @app.get("/ping")
 async def ping():
