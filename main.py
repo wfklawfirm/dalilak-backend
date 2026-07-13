@@ -173,9 +173,15 @@ MAX_DOC_TOKENS = 3500
 JWT_SECRET   = os.environ.get("JWT_SECRET", "dalilak-secret-CHANGE-IN-PROD")
 JWT_ALGO     = "HS256"
 TRIAL_DAYS   = 3
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dalilak-admin-CHANGE-IN-PROD")
+ADMIN_SECRET      = os.environ.get("ADMIN_SECRET", "dalilak-admin-CHANGE-IN-PROD")
+# ── Email / Password-reset ────────────────────────────────────────────────────
+# SECURITY: RESEND_API_KEY is consumed inside email_service.py only.
+# It is never read, logged, or surfaced here.
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "noreply@dalilak.ai")
+APP_BASE_URL      = os.environ.get("APP_BASE_URL", "https://dalilak-frontend.vercel.app").rstrip("/")
 
-from rate_limit import enforce as _rate_enforce  # noqa: E402
+from rate_limit    import enforce         as _rate_enforce     # noqa: E402
+from email_service import send_reset_email as _send_reset_email  # noqa: E402
 
 # ── JWT_SECRET startup validation ─────────────────────────────────────────────
 # Must fire before any external service client (Qdrant, OpenAI, …) is created.
@@ -272,6 +278,14 @@ def verify_pw(password: str, stored: str) -> bool:
         return key.hex() == key_hex
     except Exception:
         return False
+
+def _hash_reset_token(token: str) -> str:
+    """
+    SHA-256 digest of a raw reset token.
+    Only the hash is stored server-side; the raw token travels to the user's
+    inbox only and is never persisted.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()
 
 # ═══════════════════════════════════════════════════════════════
 #  JWT HELPERS
@@ -739,22 +753,32 @@ async def me(user: dict = Depends(get_current_user)):
 @app.post("/auth/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest, request: Request):
     await _rate_enforce(request, "forgot")
+    # Anti-enumeration: always return the same message regardless of whether
+    # the email exists. Never reveal whether an address is registered.
+    _SAFE_RESPONSE = {"message": "إذا كان البريد مسجّلاً، ستصلك رسالة إعادة التعيين خلال دقائق."}
+
     user = db_get_user_by_email(req.email.lower())
     if not user:
-        return {"message": "إذا كان البريد مسجّلاً، ستتلقى رمز الاستعادة من الدعم الفني."}
-    token = str(secrets.randbelow(900000) + 100000)
-    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    db_save_reset(user["username"], token, expires)
-    return {
-        "message": "تم إنشاء رمز الاستعادة — تواصل مع الدعم الفني للحصول عليه.",
-        "info": "سيتواصل معك فريق الدعم عبر البريد الإلكتروني.",
-    }
+        return _SAFE_RESPONSE
+
+    # 32-byte URL-safe token (43 chars). Only its SHA-256 hash is stored.
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(raw_token)
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    db_save_reset(user["username"], token_hash, expires)
+
+    reset_url = f"{APP_BASE_URL}/reset-password?token={raw_token}"
+    await _send_reset_email(req.email.lower(), reset_url, from_email=RESEND_FROM_EMAIL)
+
+    return _SAFE_RESPONSE
 
 @app.post("/auth/reset-password")
 async def reset_password(req: ResetPasswordRequest):
     if len(req.new_password) < 6:
         raise HTTPException(400, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
-    reset = db_get_reset(req.token)
+    # Hash the raw token before lookup — the DB stores only hashes, never raw tokens
+    token_hash = _hash_reset_token(req.token)
+    reset = db_get_reset(token_hash)
     if not reset:
         raise HTTPException(400, detail="رمز الاستعادة غير صحيح")
     if reset.get("used"):
