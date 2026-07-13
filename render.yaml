@@ -5,9 +5,46 @@ services:
     dockerfilePath: ./Dockerfile
     plan: free
     envVars:
+      # ── AI / Vector DB (required) ─────────────────────────────
       - key: OPENAI_API_KEY
         sync: false
       - key: QDRANT_URL
         sync: false
       - key: QDRANT_API_KEY
+        sync: false
+
+      # ── Auth security (required) ──────────────────────────────
+      # Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+      - key: JWT_SECRET
+        sync: false
+
+      # ── Rate limiting + quota (strongly recommended) ───────────
+      # Set to an Upstash Redis URL (rediss://...) for distributed enforcement.
+      # If not set, rate limits and quota run in-process and reset on restart.
+      - key: REDIS_URL
+        sync: false
+
+      # ── Password reset email (required for reset to work) ─────
+      # Resend API key from https://resend.com
+      - key: RESEND_API_KEY
+        sync: false
+      # Verified sender address in your Resend account
+      - key: RESEND_FROM_EMAIL
+        sync: false
+
+      # ── CORS + reset link origin (required) ───────────────────
+      # Your Vercel frontend URL, e.g. https://dalilak.vercel.app
+      - key: APP_BASE_URL
+        sync: false
+
+      # ── Admin bootstrap (optional) ────────────────────────────
+      # If set, this user is created as admin on startup
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      # Fallback admin secret for X-Admin-Secret header auth
+      - key: ADMIN_SECRET
         sync: false

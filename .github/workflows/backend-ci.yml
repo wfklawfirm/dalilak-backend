@@ -1,4 +1,4 @@
-name: Backend CI
+name: Backend CI — 115 Tier A Tests
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: pytest (Gate 2 — JWT validation)
+    name: pytest — full gate2 suite (115 Tier A tests)
     runs-on: ubuntu-latest
 
     steps:
@@ -24,18 +24,28 @@ jobs:
         run: |
           pip install -r requirements.txt -r requirements-test.txt
 
-      - name: Run tests
-        # Tests run from the backend root so 'import main' and 'import config' resolve.
-        # JWT_SECRET is intentionally NOT set here — the tests verify startup failure
-        # with the known default and use isolated envs for subprocess tests.
-        # No live network calls; all external service addresses are unreachable ports.
-        run: pytest tests/ -v --tb=short
+      - name: Run all Tier A offline tests
+        # Tests run from the backend root so 'import main', 'import config',
+        # 'import rate_limit', and 'import plan_quota' all resolve correctly.
+        # JWT_SECRET is intentionally NOT set — startup-failure tests verify
+        # the insecure-default rejection path.
+        # No live network calls; all external service addresses are unreachable.
+        run: pytest tests/gate2/ -v --tb=short
 
       - name: Verify config.py has no live secrets
         run: |
-          # config.py must not contain real API keys or tokens
           if grep -qE '(sk-proj-|eyJhbGci|Bearer [a-zA-Z0-9]{20})' config.py; then
             echo "FAIL: config.py appears to contain a live credential"
             exit 1
           fi
           echo "PASS: no live credentials in config.py"
+
+      - name: Verify render.yaml declares required env vars
+        run: |
+          for var in JWT_SECRET REDIS_URL RESEND_API_KEY APP_BASE_URL; do
+            if ! grep -q "$var" render.yaml; then
+              echo "FAIL: $var not declared in render.yaml"
+              exit 1
+            fi
+          done
+          echo "PASS: all required env vars declared in render.yaml"

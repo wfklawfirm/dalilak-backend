@@ -328,6 +328,29 @@ def _blocklist_prune() -> None:
     for jti in stale:
         _revoked_tokens.pop(jti, None)
 
+async def _jti_revoke_redis(jti: str, exp_ts: float) -> None:
+    """Write revoked JTI to Redis so logout survives restarts. Phase B."""
+    try:
+        from rate_limit import _get_redis
+        r = await _get_redis()
+        if r is None:
+            return
+        ttl = max(1, int(exp_ts - time.time()))
+        await r.set(f"dalilak:jti:{jti}", "1", ex=ttl)
+    except Exception as exc:
+        _log.warning("_jti_revoke_redis failed (non-fatal): %s", exc)
+
+async def _jti_is_revoked_redis(jti: str) -> bool:
+    """Check Redis for JTI revocation. Falls back to False on any error. Phase B."""
+    try:
+        from rate_limit import _get_redis
+        r = await _get_redis()
+        if r is None:
+            return False
+        return await r.exists(f"dalilak:jti:{jti}") > 0
+    except Exception:
+        return False  # fail open — never block a valid user due to Redis error
+
 def create_token(username: str, role: str = "user") -> str:
     now = datetime.now(timezone.utc)
     exp = now + timedelta(days=JWT_EXPIRY_DAYS)
@@ -507,7 +530,7 @@ async def get_current_user(
         username = payload["sub"]
         # Phase 8: check token blocklist
         jti = payload.get("jti")
-        if jti and jti in _revoked_tokens:
+        if jti and (jti in _revoked_tokens or await _jti_is_revoked_redis(jti)):
             raise HTTPException(401, detail="جلسة منتهية — سجّل الدخول مجدداً")
     except HTTPException:
         raise
@@ -915,6 +938,7 @@ async def logout(
             if jti:
                 _blocklist_prune()                # evict expired entries first
                 _revoked_tokens[jti] = float(exp)
+                await _jti_revoke_redis(jti, float(exp))  # Phase B: persist across restarts
         except Exception:
             pass  # invalid token — treat as already logged out
     return {"message": "تم تسجيل الخروج بنجاح"}
@@ -1055,9 +1079,10 @@ async def admin_list_resets(admin: dict = Depends(get_admin_user)):
             exp = datetime.fromisoformat(c["expires_at"]).replace(tzinfo=timezone.utc)
             if now < exp:
                 active.append({
-                    "username":   c["username"],
-                    "token":      c["token"],
-                    "expires_at": c["expires_at"],
+                    "username":     c["username"],
+                    "expires_at":   c["expires_at"],
+                    # token hash omitted from response — admin does not need it
+                    # (Phase B: removing hash exposure from admin endpoint)
                 })
         except Exception:
             pass
@@ -1546,26 +1571,4 @@ async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_u
 @app.on_event("startup")
 async def startup():
     admin_username = os.environ.get("ADMIN_USERNAME")
-    admin_password = os.environ.get("ADMIN_PASSWORD")
-    admin_email    = os.environ.get("ADMIN_EMAIL", "admin@dalilak.ai")
-    if admin_username and admin_password:
-        if not db_get_user(admin_username.lower()):
-            db_save_user({
-                "username":         admin_username.lower(),
-                "email":            admin_email,
-                "password_hash":    hash_pw(admin_password),
-                "full_name":        "Admin",
-                "phone":            "",
-                "plan":             "admin",
-                "role":             "admin",
-                "active":           True,
-                "trial_expires_at": None,
-                "paid_until":       None,
-                "created_at":       datetime.now(timezone.utc).isoformat(),
-                "last_login":       None,
-            })
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    a
