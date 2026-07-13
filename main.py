@@ -1615,10 +1615,17 @@ async def admin_knowledge_extract(req: FileExtractRequest, admin: dict = Depends
 #  CHAT ENDPOINTS
 # ═══════════════════════════════════════════════════════════════
 
+def _guest_quota_key(user: dict, request: Request) -> str:
+    """Per-IP quota key for unauthenticated guests (avoids shared 'guest' bucket)."""
+    if user["username"] != "guest":
+        return user["username"]
+    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+    return f"guest_{ip}"
+
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
     await _rate_enforce(request, "chat", user_id=user["username"])
-    await _check_quota(user["username"], user.get("plan", "trial"))   # Phase 10
+    await _check_quota(_guest_quota_key(user, request), user.get("plan", "guest"))   # Phase 10
     # Phase 12: reject oversized messages before any AI work
     if len(req.message) > MAX_MESSAGE_LEN:
         raise HTTPException(400, detail="الرسالة طويلة جداً — الحد الأقصى 4000 حرف")
@@ -1668,7 +1675,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
     await _rate_enforce(request, "chat", user_id=user["username"])
-    await _check_quota(user["username"], user.get("plan", "trial"))   # Phase 10
+    await _check_quota(_guest_quota_key(user, request), user.get("plan", "guest"))   # Phase 10
     # Phase 12: reject oversized messages before any AI work
     if len(req.message) > MAX_MESSAGE_LEN:
         raise HTTPException(400, detail="الرسالة طويلة جداً — الحد الأقصى 4000 حرف")
