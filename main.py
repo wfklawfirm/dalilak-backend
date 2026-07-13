@@ -1659,7 +1659,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
         "model":       model,
         "chunks_used": len(chunks),
         "elapsed_s":   round(elapsed_ms / 1000, 2),
-        "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
+        "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"], "snippet": c.get("text", "")[:300]} for c in chunks[:5]],
     }
     _cset(ck, result)
     log_query(user["username"], "chat", elapsed_ms)
@@ -1703,7 +1703,7 @@ async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(g
 
             meta = {
                 "type": "meta", "model": model, "chunks": len(chunks),
-                "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"]} for c in chunks[:5]],
+                "sources": [{"title": c["title"], "ministry": c["ministry"], "score": c["score"], "snippet": c.get("text", "")[:300]} for c in chunks[:5]],
             }
             yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
