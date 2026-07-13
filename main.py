@@ -727,7 +727,7 @@ class FileExtractRequest(BaseModel):
 #  FASTAPI APP
 # ═══════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Dalilak AI API", version="4.1.0")
+app = FastAPI(title="Dalilak AI API", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -988,7 +988,7 @@ CONFLICT_MSG = (
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "name": "Dalilak AI", "version": "4.1.0"}
+    return {"status": "ok", "name": "Dalilak AI", "version": "4.2.0"}
 
 @app.get("/health")
 async def health():
