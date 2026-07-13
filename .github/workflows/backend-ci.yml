@@ -1,4 +1,4 @@
-name: Backend CI — 115 Tier A Tests
+name: Backend CI — 131 Tier A Tests
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: pytest — full gate2 suite (115 Tier A tests)
+    name: pytest — full gate2 suite (131 Tier A tests)
     runs-on: ubuntu-latest
 
     steps:

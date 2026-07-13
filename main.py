@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """Dalilak AI — FastAPI Backend v4 (Auth + Subscriptions + Admin)"""
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -328,28 +329,120 @@ def _blocklist_prune() -> None:
     for jti in stale:
         _revoked_tokens.pop(jti, None)
 
+# ── Redis JTI state machine ────────────────────────────────────────────────
+# Three states, never conflated:
+#   REDIS_NOT_CONFIGURED        — REDIS_URL absent at startup; in-memory only
+#   REDIS_HEALTHY               — connected and responding
+#   REDIS_TEMPORARILY_UNAVAILABLE — was healthy, now unreachable
+_REDIS_NOT_CONFIGURED = "REDIS_NOT_CONFIGURED"
+_REDIS_HEALTHY        = "REDIS_HEALTHY"
+_REDIS_UNAVAILABLE    = "REDIS_TEMPORARILY_UNAVAILABLE"
+
+_redis_jti_status: str = _REDIS_NOT_CONFIGURED   # updated at first use
+_REDIS_JTI_TIMEOUT = 2.0  # seconds — short timeout for auth-path Redis calls
+
+import os as _os
+_REDIS_CONFIGURED_AT_STARTUP: bool = bool(_os.environ.get("REDIS_URL", "").strip())
+if not _REDIS_CONFIGURED_AT_STARTUP:
+    _log.warning(
+        "[jti] REDIS_URL not set — JTI revocation is in-memory only. "
+        "Logout revocation will NOT survive a backend restart. "
+        "Set REDIS_URL to enable durable revocation."
+    )
+
 async def _jti_revoke_redis(jti: str, exp_ts: float) -> None:
-    """Write revoked JTI to Redis so logout survives restarts. Phase B."""
+    """
+    Write revoked JTI to Redis with remaining-lifetime TTL.
+    If Redis is not configured, silently skips (in-memory path is sufficient).
+    If Redis is configured but fails, logs operational alert — does NOT silently succeed.
+    Privacy: jti value is never logged.
+    """
+    global _redis_jti_status
+    if not _REDIS_CONFIGURED_AT_STARTUP:
+        return  # in-memory path; degraded health already logged at startup
     try:
         from rate_limit import _get_redis
         r = await _get_redis()
         if r is None:
+            _redis_jti_status = _REDIS_UNAVAILABLE
+            _log.error(
+                "[jti][ALERT] Redis configured but client unavailable during logout revocation. "
+                "Revocation stored in-memory only for this instance. "
+                "req_id=<see request log>"
+            )
             return
         ttl = max(1, int(exp_ts - time.time()))
-        await r.set(f"dalilak:jti:{jti}", "1", ex=ttl)
+        await asyncio.wait_for(
+            r.set(f"dalilak:jti:{jti}", "1", ex=ttl),
+            timeout=_REDIS_JTI_TIMEOUT,
+        )
+        _redis_jti_status = _REDIS_HEALTHY
+    except asyncio.TimeoutError:
+        _redis_jti_status = _REDIS_UNAVAILABLE
+        _log.error(
+            "[jti][ALERT] Redis timeout during logout revocation (%.1fs limit). "
+            "Revocation in-memory only for this instance.",
+            _REDIS_JTI_TIMEOUT,
+        )
     except Exception as exc:
-        _log.warning("_jti_revoke_redis failed (non-fatal): %s", exc)
+        _redis_jti_status = _REDIS_UNAVAILABLE
+        _log.error("[jti][ALERT] Redis error during logout revocation: %s", type(exc).__name__)
+
 
 async def _jti_is_revoked_redis(jti: str) -> bool:
-    """Check Redis for JTI revocation. Falls back to False on any error. Phase B."""
+    """
+    Check Redis for JTI revocation.
+
+    Policy:
+    - REDIS_NOT_CONFIGURED  → return False (in-memory is the only store; already checked)
+    - REDIS_HEALTHY/unknown → query Redis; raise 503 on failure (do NOT accept token)
+    - timeout               → raise 503 (fail closed when Redis was previously healthy)
+
+    Privacy: jti value is never logged.
+    Raises HTTPException(503) if Redis is configured but unreachable.
+    """
+    global _redis_jti_status
+    if not _REDIS_CONFIGURED_AT_STARTUP:
+        return False  # in-memory already checked by caller
+
     try:
         from rate_limit import _get_redis
         r = await _get_redis()
         if r is None:
-            return False
-        return await r.exists(f"dalilak:jti:{jti}") > 0
-    except Exception:
-        return False  # fail open — never block a valid user due to Redis error
+            # Redis was configured but client unavailable — fail closed
+            _redis_jti_status = _REDIS_UNAVAILABLE
+            _log.error(
+                "[jti][ALERT] Redis configured but client unavailable during token verification."
+            )
+            raise HTTPException(
+                503,
+                detail="خدمة التحقق من الجلسة غير متاحة مؤقتاً — حاول مجدداً",
+            )
+        result = await asyncio.wait_for(
+            r.exists(f"dalilak:jti:{jti}"),
+            timeout=_REDIS_JTI_TIMEOUT,
+        )
+        _redis_jti_status = _REDIS_HEALTHY
+        return result > 0
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        _redis_jti_status = _REDIS_UNAVAILABLE
+        _log.error(
+            "[jti][ALERT] Redis timeout during token verification (%.1fs limit).",
+            _REDIS_JTI_TIMEOUT,
+        )
+        raise HTTPException(
+            503,
+            detail="خدمة التحقق من الجلسة غير متاحة مؤقتاً — حاول مجدداً",
+        )
+    except Exception as exc:
+        _redis_jti_status = _REDIS_UNAVAILABLE
+        _log.error("[jti][ALERT] Redis error during token verification: %s", type(exc).__name__)
+        raise HTTPException(
+            503,
+            detail="خدمة التحقق من الجلسة غير متاحة مؤقتاً — حاول مجدداً",
+        )
 
 def create_token(username: str, role: str = "user") -> str:
     now = datetime.now(timezone.utc)
@@ -747,15 +840,43 @@ async def root():
 
 @app.get("/health")
 async def health():
+    report: dict = {}
+
+    # ── Qdrant ──────────────────────────────────────────────────────────────
+    qdrant_ok = False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"{qdrant_url()}/collections/{COLLECTION}", headers=qdrant_headers())
         pts = r.json().get("result", {}).get("points_count", 0)
-        return {"status": "ok", "collection": COLLECTION, "points": pts}
+        report["qdrant"] = {"status": "ok", "collection": COLLECTION, "points": pts}
+        qdrant_ok = True
     except Exception as e:
-        # Phase 9: log internally, never expose exception detail to client
-        _log.warning("health check failed: %s", e)
-        raise HTTPException(503, detail="خدمة البحث غير متوفرة مؤقتاً")
+        _log.warning("health check — Qdrant failed: %s", e)
+        report["qdrant"] = {"status": "unavailable"}
+
+    # ── Redis ────────────────────────────────────────────────────────────────
+    if not _REDIS_CONFIGURED_AT_STARTUP:
+        report["redis"] = {
+            "status": _REDIS_NOT_CONFIGURED,
+            "note": "in-memory fallback active; logout revocation not durable across restarts",
+        }
+    else:
+        report["redis"] = {"status": _redis_jti_status}
+
+    # ── Email provider ───────────────────────────────────────────────────────
+    resend_key_present = bool(os.environ.get("RESEND_API_KEY", "").strip())
+    report["email"] = {
+        "provider": "Resend",
+        "ready": resend_key_present,
+        "note": "RESEND_API_KEY not configured" if not resend_key_present else "configured",
+    }
+
+    # ── Overall status ───────────────────────────────────────────────────────
+    if not qdrant_ok:
+        report["status"] = "degraded"
+        raise HTTPException(503, detail=report)
+    report["status"] = "ok"
+    return report
 
 @app.get("/ping")
 async def ping():
@@ -894,7 +1015,23 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
     db_save_reset(user["username"], token_hash, expires)
 
     reset_url = f"{APP_BASE_URL}/reset-password?token={raw_token}"
-    await _send_reset_email(req.email.lower(), reset_url, from_email=RESEND_FROM_EMAIL)
+    email_ok = await _send_reset_email(req.email.lower(), reset_url, from_email=RESEND_FROM_EMAIL)
+
+    if not email_ok:
+        # Email delivery failed — immediately invalidate the token so it
+        # cannot be used even though no email reached the user.
+        # Correlation ID in log: omit token value entirely (no PII).
+        corr_id = secrets.token_hex(8)
+        _log.error(
+            "[forgot_password][ALERT] Email delivery failed — token invalidated. "
+            "corr_id=%s username_hash=%s",
+            corr_id,
+            _hash_reset_token(user["username"])[:8],   # partial hash, not PII
+        )
+        try:
+            db_mark_reset_used(user["username"])
+        except Exception as ex:
+            _log.error("[forgot_password] Could not invalidate token: %s corr_id=%s", type(ex).__name__, corr_id)
 
     return _SAFE_RESPONSE
 
