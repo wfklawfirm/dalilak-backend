@@ -292,12 +292,29 @@ def _hash_reset_token(token: str) -> str:
 #  JWT HELPERS
 # ═══════════════════════════════════════════════════════════════
 
+JWT_EXPIRY_DAYS = 7   # Phase 8: reduced from 30 days
+
+# Phase 8 — In-memory token blocklist: {jti: exp_epoch_float}
+# Cleared on restart; safe because JWTs also expire in 7 days.
+_revoked_tokens: dict[str, float] = {}
+
+def _blocklist_prune() -> None:
+    """Evict expired entries — they can no longer be used anyway."""
+    now = time.time()
+    stale = [jti for jti, exp in _revoked_tokens.items() if exp < now]
+    for jti in stale:
+        _revoked_tokens.pop(jti, None)
+
 def create_token(username: str, role: str = "user") -> str:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(days=JWT_EXPIRY_DAYS)
     payload = {
+        "iss": "dalilak-ai",
         "sub": username,
         "role": role,
-        "iat": int(datetime.now(timezone.utc).timestamp()),
-        "exp": int((datetime.now(timezone.utc) + timedelta(days=30)).timestamp()),
+        "jti": secrets.token_hex(8),   # unique token ID — used for blocklist
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
     }
     return _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
@@ -465,6 +482,12 @@ async def get_current_user(
     try:
         payload = decode_token(creds.credentials)
         username = payload["sub"]
+        # Phase 8: check token blocklist
+        jti = payload.get("jti")
+        if jti and jti in _revoked_tokens:
+            raise HTTPException(401, detail="جلسة منتهية — سجّل الدخول مجدداً")
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(401, detail="جلسة منتهية — سجّل الدخول مجدداً")
     user = db_get_user(username)
@@ -548,8 +571,11 @@ app = FastAPI(title="Dalilak AI API", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"],
-    allow_headers=["*"], allow_credentials=True,
+    # Phase 8: restrict to known origins (wildcard removed)
+    allow_origins=[APP_BASE_URL, "http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -666,8 +692,8 @@ async def register(req: RegisterRequest, request: Request):
     await _rate_enforce(request, "register")
     if len(req.username) < 3:
         raise HTTPException(400, detail="اسم المستخدم يجب أن يكون 3 أحرف على الأقل")
-    if len(req.password) < 6:
-        raise HTTPException(400, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+    if len(req.password) < 8:  # Phase 8: raised from 6 to 8
+        raise HTTPException(400, detail="كلمة المرور يجب أن تكون 8 أحرف على الأقل")
     if "@" not in req.email:
         raise HTTPException(400, detail="البريد الإلكتروني غير صالح")
     if db_get_user(req.username.lower()):
@@ -796,8 +822,8 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
 
 @app.post("/auth/reset-password")
 async def reset_password(req: ResetPasswordRequest):
-    if len(req.new_password) < 6:
-        raise HTTPException(400, detail="كلمة المرور يجب أن تكون 6 أحرف على الأقل")
+    if len(req.new_password) < 8:  # Phase 8: raised from 6 to 8
+        raise HTTPException(400, detail="كلمة المرور يجب أن تكون 8 أحرف على الأقل")
     # Hash the raw token before lookup — the DB stores only hashes, never raw tokens
     token_hash = _hash_reset_token(req.token)
     reset = db_get_reset(token_hash)
@@ -820,6 +846,23 @@ async def reset_password(req: ResetPasswordRequest):
     db_save_user(user)
     db_mark_reset_used(reset["username"])
     return {"message": "تم تغيير كلمة المرور بنجاح — يمكنك تسجيل الدخول الآن."}
+
+@app.post("/auth/logout")
+async def logout(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+):
+    """Phase 8: revoke the bearer token by adding its jti to the in-memory blocklist."""
+    if creds:
+        try:
+            payload = decode_token(creds.credentials)
+            jti = payload.get("jti")
+            exp = payload.get("exp", time.time() + 86400)
+            if jti:
+                _blocklist_prune()                # evict expired entries first
+                _revoked_tokens[jti] = float(exp)
+        except Exception:
+            pass  # invalid token — treat as already logged out
+    return {"message": "تم تسجيل الخروج بنجاح"}
 
 # ═══════════════════════════════════════════════════════════════
 #  ADMIN ENDPOINTS
