@@ -175,6 +175,8 @@ JWT_ALGO     = "HS256"
 TRIAL_DAYS   = 3
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dalilak-admin-CHANGE-IN-PROD")
 
+from rate_limit import enforce as _rate_enforce  # noqa: E402
+
 # ── JWT_SECRET startup validation ─────────────────────────────────────────────
 # Must fire before any external service client (Qdrant, OpenAI, …) is created.
 # SECURITY: JWT_SECRET value is never logged, printed, or included in output.
@@ -624,7 +626,8 @@ async def ping():
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/auth/register")
-async def register(req: RegisterRequest):
+async def register(req: RegisterRequest, request: Request):
+    await _rate_enforce(request, "register")
     if len(req.username) < 3:
         raise HTTPException(400, detail="اسم المستخدم يجب أن يكون 3 أحرف على الأقل")
     if len(req.password) < 6:
@@ -667,7 +670,8 @@ async def register(req: RegisterRequest):
     }
 
 @app.post("/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    await _rate_enforce(request, "login")
     user = db_get_user(req.username.lower())
     if not user:
         user = db_get_user_by_email(req.username.lower())
@@ -733,7 +737,8 @@ async def me(user: dict = Depends(get_current_user)):
     }
 
 @app.post("/auth/forgot-password")
-async def forgot_password(req: ForgotPasswordRequest):
+async def forgot_password(req: ForgotPasswordRequest, request: Request):
+    await _rate_enforce(request, "forgot")
     user = db_get_user_by_email(req.email.lower())
     if not user:
         return {"message": "إذا كان البريد مسجّلاً، ستتلقى رمز الاستعادة من الدعم الفني."}
@@ -1174,7 +1179,8 @@ async def admin_knowledge_extract(req: FileExtractRequest, admin: dict = Depends
 # ═══════════════════════════════════════════════════════════════
 
 @app.post("/chat")
-async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
+async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
+    await _rate_enforce(request, "chat", user_id=user["username"])
     ck = _ck(req.message, req.domain)
     cached = _cget(ck)
     if cached:
@@ -1203,7 +1209,8 @@ async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     return result
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, user: dict = Depends(get_current_user)):
+async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
+    await _rate_enforce(request, "chat", user_id=user["username"])
     async def generate() -> AsyncGenerator[str, None]:
         try:
             t0 = time.time()
