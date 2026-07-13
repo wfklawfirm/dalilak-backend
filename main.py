@@ -205,10 +205,11 @@ except _CfgError as _exc:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Qdrant collections for users & logs
-USERS_COL    = "dalilak_users"
-LOGS_COL     = "dalilak_logs"
-RESETS_COL   = "dalilak_resets"
-_users_ready = _logs_ready = _resets_ready = False
+USERS_COL      = "dalilak_users"
+LOGS_COL       = "dalilak_logs"
+RESETS_COL     = "dalilak_resets"
+FEEDBACK_COL   = "dalilak_feedback"
+_users_ready = _logs_ready = _resets_ready = _feedback_ready = False
 
 # ═══════════════════════════════════════════════════════════════
 #  SYSTEM PROMPT
@@ -506,6 +507,22 @@ def _ensure_resets() -> None:
         except Exception:
             pass
     _resets_ready = True
+
+def _ensure_feedback() -> None:
+    global _feedback_ready
+    if _feedback_ready:
+        return
+    q = qdrant()
+    try:
+        q.get_collection(FEEDBACK_COL)
+    except Exception:
+        q.create_collection(FEEDBACK_COL, vectors_config=VectorParams(size=1, distance=Distance.DOT))
+        try:
+            q.create_payload_index(FEEDBACK_COL, "username", PayloadSchemaType.KEYWORD)
+            q.create_payload_index(FEEDBACK_COL, "rating", PayloadSchemaType.KEYWORD)
+        except Exception:
+            pass
+    _feedback_ready = True
 
 def _uid(username: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"dalilak_user_{username}"))
@@ -1446,6 +1463,49 @@ async def admin_all_logs(admin: dict = Depends(get_admin_user)):
         "daily_activity": daily,
         "top_users": [{"username": u, "count": c} for u, c in top_users],
     }
+
+# ── User feedback ────────────────────────────────────────────
+class FeedbackRequest(BaseModel):
+    question: str
+    answer: str
+    rating: str      # "up" | "down"
+    confidence: str = "unknown"
+
+@app.post("/feedback", status_code=201)
+async def submit_feedback(req: FeedbackRequest, user: dict = Depends(get_current_user)):
+    """Store a thumbs-up or thumbs-down rating for an answer."""
+    _ensure_feedback()
+    entry_id = uuid.uuid4().int & 0x7FFFFFFF
+    qdrant().upsert(
+        collection_name=FEEDBACK_COL,
+        points=[PointStruct(
+            id=entry_id,
+            vector=[0.0],
+            payload={
+                "username":   user["username"],
+                "rating":     req.rating,
+                "question":   req.question[:500],
+                "answer":     req.answer[:800],
+                "confidence": req.confidence,
+                "timestamp":  datetime.now(timezone.utc).isoformat(),
+            },
+        )],
+    )
+    return {"message": "شكراً على تقييمك"}
+
+@app.get("/admin/feedback")
+async def admin_feedback(admin: dict = Depends(get_admin_user), limit: int = 100):
+    """Return recent feedback entries for the admin panel."""
+    _ensure_feedback()
+    results, _ = qdrant().scroll(
+        collection_name=FEEDBACK_COL, limit=limit, with_payload=True
+    )
+    entries = sorted(
+        [r.payload for r in results if r.payload],
+        key=lambda x: x.get("timestamp", ""),
+        reverse=True,
+    )
+    return {"feedback": entries, "total": len(entries)}
 
 # ── Knowledge base management ────────────────────────────────
 class KnowledgeAddRequest(BaseModel):
