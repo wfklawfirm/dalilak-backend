@@ -8,6 +8,7 @@ import io
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -173,6 +174,17 @@ JWT_SECRET   = os.environ.get("JWT_SECRET", "dalilak-secret-CHANGE-IN-PROD")
 JWT_ALGO     = "HS256"
 TRIAL_DAYS   = 3
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dalilak-admin-CHANGE-IN-PROD")
+
+# ── JWT_SECRET startup validation ─────────────────────────────────────────────
+# Must fire before any external service client (Qdrant, OpenAI, …) is created.
+# SECURITY: JWT_SECRET value is never logged, printed, or included in output.
+from config import validate_security_configuration as _validate_cfg, ConfigurationError as _CfgError  # noqa: E402
+try:
+    _validate_cfg(JWT_SECRET)
+except _CfgError as _exc:
+    sys.stderr.write(str(_exc) + "\n")
+    sys.exit(1)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Qdrant collections for users & logs
 USERS_COL    = "dalilak_users"
