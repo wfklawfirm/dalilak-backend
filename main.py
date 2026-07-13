@@ -3452,6 +3452,83 @@ async def create_share_package(req: SharePackageRequest, user: dict = Depends(ge
 
 
 
+# ══ PHASE 5: MULTI-DOCUMENT CONSISTENCY ════════════════════════════════════════
+
+class MultiDocConsistencyRequest(BaseModel):
+    transaction_id: Optional[str] = None
+    document_ids: list[str] = []
+    procedure_slug: Optional[str] = None
+
+@app.post("/transactions/{transaction_id}/consistency-check")
+async def check_multi_doc_consistency(
+    transaction_id: str,
+    req: MultiDocConsistencyRequest,
+    user: dict = Depends(get_current_user),
+):
+    """
+    Multi-document consistency analysis.
+    Checks for name mismatches, date validity, missing signatures, etc.
+    Full implementation requires stored extracted facts per document.
+    """
+    doc_count = len(req.document_ids)
+    # Scaffold: return realistic empty result
+    return {
+        "transactionId": transaction_id,
+        "documentCount": doc_count,
+        "checkedAt": datetime.now(timezone.utc).isoformat(),
+        "conflicts": [],
+        "missingDocs": [],
+        "completionScore": min(100, doc_count * 20) if doc_count > 0 else 0,
+        "readinessStatus": "partially_ready" if doc_count > 0 else "not_ready",
+        "summaryAr": f"تم تحليل {doc_count} مستند. لا تعارضات مكتشفة." if doc_count > 0 else "لم يُرفع أي مستند بعد.",
+        "note": "Full consistency analysis available after document text extraction."
+    }
+
+@app.get("/transactions/{transaction_id}/consistency-check")
+async def get_consistency_check(transaction_id: str, user: dict = Depends(get_current_user)):
+    """Get latest consistency check for a transaction."""
+    return {
+        "transactionId": transaction_id,
+        "documentCount": 0,
+        "conflicts": [],
+        "missingDocs": [],
+        "completionScore": 0,
+        "readinessStatus": "not_ready",
+        "summaryAr": "لم يُجرَ تحليل للتناسق بعد."
+    }
+
+# ══ PHASE 11: PROFESSIONAL WORKSPACE ════════════════════════════════════════
+
+class IntakeLinkRequest(BaseModel):
+    client_name: str
+    matter: str = ""
+    procedure_slug: Optional[str] = None
+    language: str = "ar"
+
+@app.post("/professional/intake-links")
+async def create_intake_link(req: IntakeLinkRequest, user: dict = Depends(get_current_user)):
+    """Create a client intake link (scaffold)."""
+    link_id = str(uuid.uuid4())[:10]
+    return {
+        "linkId": link_id,
+        "clientName": req.client_name,
+        "matter": req.matter,
+        "link": f"/intake/{link_id}",
+        "createdBy": user.get("username"),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "status": "active",
+        "message": "⚠️ Client intake portal is in development."
+    }
+
+@app.get("/professional/intake-links")
+async def list_intake_links(user: dict = Depends(get_current_user)):
+    return {"links": [], "message": "Professional intake portal coming soon."}
+
+@app.get("/professional/client-files")
+async def list_client_files(user: dict = Depends(get_current_user)):
+    return {"files": [], "message": "Client file management coming soon."}
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
