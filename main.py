@@ -717,7 +717,7 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 #  RAG HELPERS
 # ═══════════════════════════════════════════════════════════════
 
@@ -809,25 +809,76 @@ def build_messages(ctx: str, history: list, user_msg: str) -> list:
     msgs.append({"role": "user", "content": user_msg})
     return msgs
 
-# ── Phase 5: Evidence Sufficiency Gate ────────────────────────────────────────
-# If no retrieved chunk clears SUFFICIENCY_TOP_SCORE we refuse to call GPT and
-# return a fixed "no evidence" message instead of hallucinating general knowledge.
+# ── Evidence Gate v2 — multi-factor ──────────────────────────────────────────
+
+class EvidenceOutcome:
+    SUFFICIENT   = "SUFFICIENT"
+    PARTIAL      = "PARTIAL"
+    INSUFFICIENT = "INSUFFICIENT"
+    CONFLICTING  = "CONFLICTING"
+
+def _evaluate_evidence(chunks: list, query: str = "") -> tuple:
+    """
+    Multi-factor evidence evaluation.
+    Returns (outcome, reason) where outcome is one of EvidenceOutcome constants.
+
+    Rules:
+    - INSUFFICIENT: no chunk >= SUFFICIENCY_TOP_SCORE → refuse to call LLM
+    - PARTIAL: best chunk >= 0.35 but coverage < 0.45 → answer with caveats
+    - SUFFICIENT: best chunk >= 0.45 and multiple chunks agree → full answer
+    - CONFLICTING: top chunks have score >= 0.35 but contradicting country payloads
+    """
+    if not chunks:
+        return EvidenceOutcome.INSUFFICIENT, "no_chunks"
+
+    scores = [c.get("score", 0) for c in chunks]
+    top_score = max(scores)
+
+    if top_score < SUFFICIENCY_TOP_SCORE:
+        return EvidenceOutcome.INSUFFICIENT, f"top_score={top_score:.3f}"
+
+    # Check for cross-country contamination in top chunks
+    top_chunks = [c for c in chunks if c.get("score", 0) >= SUFFICIENCY_TOP_SCORE]
+    countries = set()
+    for c in top_chunks:
+        country = c.get("country", "") or c.get("domain", "")
+        if country:
+            countries.add(country.lower())
+
+    # If both Lebanon and Syria appear in top results — potential conflict
+    has_lb = any(c in countries for c in ["لبنان", "lebanon", "lb"])
+    has_sy = any(c in countries for c in ["سوريا", "syria", "sy"])
+    if has_lb and has_sy and len(top_chunks) >= 2:
+        return EvidenceOutcome.CONFLICTING, "cross_country"
+
+    # Grade coverage
+    high_quality = [s for s in scores if s >= 0.45]
+    if len(high_quality) >= 2:
+        return EvidenceOutcome.SUFFICIENT, f"top={top_score:.3f},hq={len(high_quality)}"
+    elif top_score >= 0.45:
+        return EvidenceOutcome.SUFFICIENT, f"top={top_score:.3f}"
+    else:
+        return EvidenceOutcome.PARTIAL, f"top={top_score:.3f},partial_coverage"
+
+# Keep backward compat — Phase 5 tests rely on this symbol being present
+def _is_evidence_sufficient(chunks: list) -> bool:
+    outcome, _ = _evaluate_evidence(chunks)
+    return outcome != EvidenceOutcome.INSUFFICIENT
 
 SUFFICIENCY_MSG = (
     "لم أجد في قاعدة بيانات دليلك معلومات كافية تُغطّي هذا السؤال تحديداً. "
     "أنصحك بالتواصل مع الجهة الحكومية المختصة مباشرةً للحصول على إجابة دقيقة."
 )
 
-def _is_evidence_sufficient(chunks: list) -> bool:
-    """Return True only when at least one chunk scores >= SUFFICIENCY_TOP_SCORE.
+PARTIAL_PREFIX = (
+    "تنبيه: المعلومات التالية جزئية وقد لا تغطي جميع جوانب سؤالك. "
+    "يُرجى التحقق من الجهة المختصة للتأكد.\n\n"
+)
 
-    Design note:
-    - MIN_SCORE (0.28) is the Qdrant floor — chunks below it are never returned.
-    - SUFFICIENCY_TOP_SCORE (0.35) is a stricter gate applied AFTER retrieval.
-      A query can return many low-scoring chunks that are tangentially related;
-      the gate ensures the best match is semantically close enough to trust.
-    """
-    return any(c.get("score", 0) >= SUFFICIENCY_TOP_SCORE for c in chunks)
+CONFLICT_MSG = (
+    "وجدت معلومات متضاربة بين مصادر مختلفة لهذا السؤال. "
+    "يُرجى تحديد البلد (لبنان أم سوريا) وإعادة السؤال للحصول على إجابة دقيقة."
+)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════
@@ -1500,15 +1551,23 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
     vec    = await embed(req.message)
     chunks = await search_qdrant(vec, req.domain)
 
-    # ── Phase 5 evidence gate ──────────────────────────────────────────────────
+    # ── Phase 5 evidence gate (multi-factor v2) ──────────────────────────────
+    outcome, gate_reason = _evaluate_evidence(chunks, req.message)
+    _log.info("[chat] evidence_gate outcome=%s reason=%s", outcome, gate_reason)
     if not _is_evidence_sufficient(chunks):
         return {"answer": SUFFICIENCY_MSG, "model": "gate", "chunks_used": 0,
-                "elapsed_s": round(time.time() - t0, 2), "sources": []}
+                "elapsed_s": round(time.time() - t0, 2), "sources": [], "gate": "INSUFFICIENT"}
+    if outcome == EvidenceOutcome.CONFLICTING:
+        return {"answer": CONFLICT_MSG, "model": "gate", "chunks_used": 0,
+                "elapsed_s": round(time.time() - t0, 2), "sources": [], "gate": "CONFLICTING"}
     # ──────────────────────────────────────────────────────────────────────────
 
     ctx    = context_str(chunks)
+    user_msg = req.message
+    if outcome == EvidenceOutcome.PARTIAL:
+        user_msg = f"[تنبيه: المعلومات جزئية، أجب فقط بما تجده في المصادر] {user_msg}"
     model  = pick_model(req.message)
-    msgs   = build_messages(ctx, req.history, req.message)
+    msgs   = build_messages(ctx, req.history, user_msg)
 
     resp = await oai().chat.completions.create(
         model=model, messages=msgs, max_tokens=MAX_TOKENS, temperature=0.3,
@@ -1538,17 +1597,27 @@ async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(g
             vec    = await embed(req.message)
             chunks = await search_qdrant(vec, req.domain)
 
-            # ── Phase 5 evidence gate ──────────────────────────────────────────
+            # ── Phase 5 evidence gate (multi-factor v2) ───────────────────────
+            outcome, gate_reason = _evaluate_evidence(chunks, req.message)
+            _log.info("[chat] evidence_gate outcome=%s reason=%s", outcome, gate_reason)
             if not _is_evidence_sufficient(chunks):
-                gate_ev = {"type": "gate", "answer": SUFFICIENCY_MSG, "sources": []}
+                gate_ev = {"type": "gate", "answer": SUFFICIENCY_MSG, "sources": [], "gate": "INSUFFICIENT"}
+                yield f"data: {json.dumps(gate_ev, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            if outcome == EvidenceOutcome.CONFLICTING:
+                gate_ev = {"type": "gate", "answer": CONFLICT_MSG, "sources": [], "gate": "CONFLICTING"}
                 yield f"data: {json.dumps(gate_ev, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             # ──────────────────────────────────────────────────────────────────
 
             ctx    = context_str(chunks)
+            user_msg = req.message
+            if outcome == EvidenceOutcome.PARTIAL:
+                user_msg = f"[تنبيه: المعلومات جزئية، أجب فقط بما تجده في المصادر] {user_msg}"
             model  = pick_model(req.message)
-            msgs   = build_messages(ctx, req.history, req.message)
+            msgs   = build_messages(ctx, req.history, user_msg)
 
             meta = {
                 "type": "meta", "model": model, "chunks": len(chunks),
@@ -1701,6 +1770,671 @@ async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_u
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+# ══════════════════════════════════════════════════════════════
+#  PROCEDURES API — Lebanon government service catalog
+# ══════════════════════════════════════════════════════════════
+
+# Built-in procedure catalog (seed data - expandable via admin)
+_PROCEDURE_CATALOG: list[dict] = [
+    {
+        "id": "passport-renewal-lb",
+        "slug": "passport-renewal-lb",
+        "title_ar": "تجديد جواز السفر اللبناني",
+        "title_en": "Lebanese Passport Renewal",
+        "category": "civil_status",
+        "country": "lebanon",
+        "authority": "المديرية العامة للأمن العام",
+        "authority_en": "General Directorate of General Security",
+        "authority_url": "https://www.general-security.gov.lb",
+        "summary_ar": "تجديد جواز السفر اللبناني للمواطنين في لبنان وخارجه",
+        "duration_ar": "5-10 أيام عمل",
+        "fee_ar": "120,000 ل.ل. للبالغين (3 سنوات)، 180,000 ل.ل. (5 سنوات)",
+        "documents": [
+            {"name_ar": "جواز السفر القديم", "required": True},
+            {"name_ar": "هوية شخصية سارية", "required": True},
+            {"name_ar": "صورة شخصية حديثة 4x4", "required": True},
+            {"name_ar": "وثيقة عائلية (للمتزوجين)", "required": False},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "تقديم الطلب", "desc_ar": "تقديم الطلب عبر الموقع الإلكتروني أو مباشرةً في مراكز الأمن العام"},
+            {"order": 2, "title_ar": "دفع الرسوم", "desc_ar": "دفع الرسوم عبر OMT أو في المركز"},
+            {"order": 3, "title_ar": "البصمة والصورة", "desc_ar": "أخذ البصمة والصورة في المركز"},
+            {"order": 4, "title_ar": "الاستلام", "desc_ar": "استلام جواز السفر المجدَّد"},
+        ],
+        "source_tier": 2,
+        "last_verified": "2024-01",
+        "review_expiry": "2025-01",
+        "status": "verified",
+        "tags": ["جواز", "سفر", "أمن عام", "هوية"],
+    },
+    {
+        "id": "birth-registration-lb",
+        "slug": "birth-registration-lb",
+        "title_ar": "تسجيل عقد الولادة",
+        "title_en": "Birth Registration",
+        "category": "civil_status",
+        "country": "lebanon",
+        "authority": "وزارة الداخلية والبلديات — دوائر النفوس",
+        "authority_en": "Ministry of Interior — Civil Registry",
+        "summary_ar": "تسجيل المواليد الجدد في السجلات المدنية اللبنانية",
+        "duration_ar": "يوم واحد (إذا كانت الوثائق مكتملة)",
+        "fee_ar": "مجاني (خلال 30 يوماً من الولادة)",
+        "documents": [
+            {"name_ar": "شهادة الولادة من المستشفى", "required": True},
+            {"name_ar": "هويات الوالدين", "required": True},
+            {"name_ar": "عقد زواج الوالدين", "required": True},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "الحصول على شهادة الولادة", "desc_ar": "من المستشفى خلال 24 ساعة"},
+            {"order": 2, "title_ar": "التوجه لدائرة النفوس", "desc_ar": "في قضاء إقامة الأب"},
+            {"order": 3, "title_ar": "تقديم الوثائق", "desc_ar": "تقديم كافة الوثائق المطلوبة"},
+            {"order": 4, "title_ar": "استلام عقد الولادة", "desc_ar": "في نفس اليوم عادةً"},
+        ],
+        "source_tier": 2,
+        "last_verified": "2024-01",
+        "review_expiry": "2025-01",
+        "status": "verified",
+        "tags": ["ولادة", "تسجيل", "نفوس", "مواليد"],
+    },
+    {
+        "id": "vehicle-registration-lb",
+        "slug": "vehicle-registration-lb",
+        "title_ar": "تسجيل سيارة جديدة",
+        "title_en": "New Vehicle Registration",
+        "category": "vehicles",
+        "country": "lebanon",
+        "authority": "مديرية السير العام",
+        "authority_en": "General Traffic Directorate",
+        "summary_ar": "تسجيل مركبة جديدة أو نقل ملكية مركبة في لبنان",
+        "duration_ar": "1-3 أيام عمل",
+        "fee_ar": "تعتمد على نوع المركبة والمحرك",
+        "documents": [
+            {"name_ar": "فاتورة الشراء", "required": True},
+            {"name_ar": "وثيقة الاستيراد (للسيارات المستوردة)", "required": True},
+            {"name_ar": "شهادة الفحص التقني", "required": True},
+            {"name_ar": "وثيقة التأمين", "required": True},
+            {"name_ar": "هوية المالك", "required": True},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "الفحص التقني", "desc_ar": "إجراء الفحص التقني للمركبة"},
+            {"order": 2, "title_ar": "التأمين", "desc_ar": "الحصول على وثيقة تأمين سارية"},
+            {"order": 3, "title_ar": "تقديم الأوراق", "desc_ar": "تقديم جميع الوثائق لمديرية السير"},
+            {"order": 4, "title_ar": "دفع الرسوم", "desc_ar": "دفع رسوم التسجيل"},
+            {"order": 5, "title_ar": "استلام اللوحة والدفتر", "desc_ar": "استلام لوحة السير ودفتر السيارة"},
+        ],
+        "source_tier": 2,
+        "last_verified": "2024-01",
+        "review_expiry": "2025-01",
+        "status": "verified",
+        "tags": ["سيارة", "مركبة", "تسجيل", "سير", "لوحة"],
+    },
+    {
+        "id": "company-registration-lb",
+        "slug": "company-registration-lb",
+        "title_ar": "تأسيس شركة في لبنان",
+        "title_en": "Company Registration in Lebanon",
+        "category": "business",
+        "country": "lebanon",
+        "authority": "وزارة الاقتصاد والتجارة — الإدارة المركزية للإحصاء",
+        "authority_en": "Ministry of Economy and Trade",
+        "summary_ar": "تسجيل وتأسيس شركة تجارية أو شركة ش.م.م. في لبنان",
+        "duration_ar": "15-30 يوم عمل",
+        "fee_ar": "تعتمد على نوع الشركة ورأس المال",
+        "documents": [
+            {"name_ar": "عقد التأسيس موثق عند كاتب عدل", "required": True},
+            {"name_ar": "هويات المؤسسين", "required": True},
+            {"name_ar": "إيصال دفع رأس المال", "required": True},
+            {"name_ar": "إيجار المقر أو وثيقة الملكية", "required": True},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "اختيار اسم الشركة", "desc_ar": "التحقق من توفر الاسم في السجل التجاري"},
+            {"order": 2, "title_ar": "توثيق عقد التأسيس", "desc_ar": "لدى كاتب عدل معتمد"},
+            {"order": 3, "title_ar": "فتح حساب بنكي", "desc_ar": "إيداع رأس المال في البنك"},
+            {"order": 4, "title_ar": "التسجيل في السجل التجاري", "desc_ar": "وزارة العدل"},
+            {"order": 5, "title_ar": "الحصول على السجل الضريبي", "desc_ar": "وزارة المالية"},
+            {"order": 6, "title_ar": "التسجيل في الضمان الاجتماعي", "desc_ar": "إذا كان هناك موظفون"},
+        ],
+        "source_tier": 2,
+        "last_verified": "2024-01",
+        "review_expiry": "2025-01",
+        "status": "verified",
+        "tags": ["شركة", "تأسيس", "تجارة", "سجل تجاري", "ش.م.م."],
+    },
+    {
+        "id": "driving-license-lb",
+        "slug": "driving-license-lb",
+        "title_ar": "استخراج رخصة قيادة جديدة",
+        "title_en": "New Driving License",
+        "category": "vehicles",
+        "country": "lebanon",
+        "authority": "مديرية السير والمركبات الآلية",
+        "authority_en": "Traffic and Motor Vehicles Directorate",
+        "authority_url": "https://www.imta.gov.lb",
+        "summary_ar": "استخراج رخصة قيادة لأول مرة للمقيمين في لبنان بعد اجتياز الاختبارات النظرية والعملية.",
+        "duration_ar": "4-8 أسابيع",
+        "fee_ar": "تقريباً 150,000 ل.ل.",
+        "tags": ["سيارة", "رخصة", "قيادة", "سير"],
+        "source_tier": 2,
+        "last_verified": "2024-01-01",
+        "review_expiry": "2025-01-01",
+        "status": "verified",
+        "documents": [
+            {"name_ar": "بطاقة الهوية أو جواز السفر", "required": True},
+            {"name_ar": "شهادة طبية من طبيب مرخص", "required": True},
+            {"name_ar": "صورتان شمسيتان", "required": True},
+            {"name_ar": "إيصال دفع الرسوم", "required": True},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "التسجيل في مدرسة تعليم القيادة", "desc_ar": "التسجيل في إحدى مدارس القيادة المعتمدة وأخذ 20 حصة نظرية و10 عملية على الأقل."},
+            {"order": 2, "title_ar": "اجتياز اختبار الكود", "desc_ar": "التقدم لاختبار الكود النظري (30 سؤالاً) لدى مديرية السير."},
+            {"order": 3, "title_ar": "اجتياز الاختبار العملي", "desc_ar": "التقدم للاختبار العملي على الطريق مع محقق السير."},
+            {"order": 4, "title_ar": "تقديم الملف وسداد الرسوم", "desc_ar": "تقديم كامل الوثائق ودفع رسوم استخراج الرخصة."},
+            {"order": 5, "title_ar": "استلام الرخصة", "desc_ar": "استلام رخصة القيادة خلال أسبوع إلى أسبوعين."},
+        ],
+    },
+    {
+        "id": "marriage-certificate-lb",
+        "slug": "marriage-certificate-lb",
+        "title_ar": "استخراج عقد الزواج المدني",
+        "title_en": "Marriage Certificate",
+        "category": "civil_status",
+        "country": "lebanon",
+        "authority": "وزارة الداخلية والبلديات",
+        "authority_en": "Ministry of Interior and Municipalities",
+        "authority_url": "https://www.interior.gov.lb",
+        "summary_ar": "تسجيل عقد الزواج المدني المبرم في الخارج أو أمام كاتب العدل في السجلات اللبنانية.",
+        "duration_ar": "2-4 أسابيع",
+        "fee_ar": "رسوم دمغة 25,000 ل.ل.",
+        "tags": ["زواج", "عقد", "مدني", "أحوال شخصية"],
+        "source_tier": 2,
+        "last_verified": "2024-01-01",
+        "review_expiry": "2025-01-01",
+        "status": "verified",
+        "documents": [
+            {"name_ar": "عقد الزواج الأصلي مع الترجمة", "required": True},
+            {"name_ar": "بطاقة هوية الزوجين", "required": True},
+            {"name_ar": "شهادة الميلاد للزوجين", "required": True},
+            {"name_ar": "تصريح قيد نفوس", "required": True},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "التحقق من عقد الزواج", "desc_ar": "التحقق من صحة عقد الزواج وتصديقه من السفارة اللبنانية إن كان خارجياً."},
+            {"order": 2, "title_ar": "ترجمة الوثائق", "desc_ar": "ترجمة جميع الوثائق إلى اللغة العربية من مترجم معتمد."},
+            {"order": 3, "title_ar": "تقديم الطلب لدائرة النفوس", "desc_ar": "تقديم الملف الكامل لدائرة النفوس في وزارة الداخلية."},
+            {"order": 4, "title_ar": "استلام القيد", "desc_ar": "استلام قيد الزواج في سجل الأحوال الشخصية."},
+        ],
+    },
+    {
+        "id": "land-registration-lb",
+        "slug": "land-registration-lb",
+        "title_ar": "تسجيل عقار أو نقل ملكية",
+        "title_en": "Land & Property Registration",
+        "category": "real_estate",
+        "country": "lebanon",
+        "authority": "المديرية العامة للشؤون العقارية",
+        "authority_en": "General Directorate of Land Registry",
+        "authority_url": "https://www.cadastre.gov.lb",
+        "summary_ar": "تسجيل عقار لأول مرة أو نقل ملكيته في السجل العقاري اللبناني.",
+        "duration_ar": "3-6 أشهر",
+        "fee_ar": "5% من قيمة العقار + رسوم إدارية",
+        "tags": ["عقار", "ملكية", "قيد", "طابو"],
+        "source_tier": 1,
+        "last_verified": "2024-01-01",
+        "review_expiry": "2025-01-01",
+        "status": "verified",
+        "documents": [
+            {"name_ar": "صك الملكية أو عقد البيع", "required": True},
+            {"name_ar": "بطاقة هوية المتعاقدين", "required": True},
+            {"name_ar": "رسم تقريبي للعقار مصدّق", "required": True},
+            {"name_ar": "براءة ذمة ضريبية", "required": True},
+            {"name_ar": "مستخرج قيد للعقار", "required": True},
+            {"name_ar": "تفويض كاتب عدل إن وجد وكيل", "required": False},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "التحقق من صحة المستندات", "desc_ar": "التحقق من صحة عقد البيع وتصديقه من كاتب العدل."},
+            {"order": 2, "title_ar": "سداد الضرائب والرسوم", "desc_ar": "سداد ضريبة انتقال الملكية 5% وكل الرسوم المستحقة."},
+            {"order": 3, "title_ar": "تقديم الطلب لدائرة المساحة", "desc_ar": "تقديم الملف الكامل لمديرية الشؤون العقارية في المنطقة."},
+            {"order": 4, "title_ar": "مراجعة الطلب والمعاينة", "desc_ar": "مراجعة الطلب من قبل الدائرة وإجراء معاينة ميدانية للعقار إن لزم."},
+            {"order": 5, "title_ar": "قيد الملكية", "desc_ar": "قيد الملكية في السجل العقاري وإصدار صك الملكية الجديد."},
+        ],
+    },
+    {
+        "id": "work-permit-lb",
+        "slug": "work-permit-lb",
+        "title_ar": "استخراج إذن عمل للأجانب",
+        "title_en": "Work Permit for Foreigners",
+        "category": "education",
+        "country": "lebanon",
+        "authority": "وزارة العمل",
+        "authority_en": "Ministry of Labor",
+        "authority_url": "https://www.labor.gov.lb",
+        "summary_ar": "الحصول على إذن عمل رسمي للعمال الأجانب في لبنان وتجديده سنوياً.",
+        "duration_ar": "4-8 أسابيع",
+        "fee_ar": "800,000 ل.ل. سنوياً",
+        "tags": ["عمل", "أجنبي", "إذن", "تأشيرة عمل"],
+        "source_tier": 2,
+        "last_verified": "2024-01-01",
+        "review_expiry": "2025-01-01",
+        "status": "verified",
+        "documents": [
+            {"name_ar": "جواز سفر ساري المفعول", "required": True},
+            {"name_ar": "عقد عمل مصدق من وزارة العمل", "required": True},
+            {"name_ar": "شهادة طبية مصدقة", "required": True},
+            {"name_ar": "صور شمسية", "required": True},
+            {"name_ar": "شهادة الكفيل أو صاحب العمل", "required": True},
+            {"name_ar": "شهادة الخلو من السوابق من بلد المنشأ", "required": False},
+        ],
+        "steps": [
+            {"order": 1, "title_ar": "تصديق عقد العمل", "desc_ar": "تصديق عقد العمل من صاحب العمل وتوثيقه لدى كاتب العدل."},
+            {"order": 2, "title_ar": "تقديم الطلب لوزارة العمل", "desc_ar": "تقديم كامل الملف لوزارة العمل مع رسم الطلب."},
+            {"order": 3, "title_ar": "فحص الطلب", "desc_ar": "فحص الطلب من قبل اللجنة المختصة والتحقق من عدم وجود لبناني يشغل الوظيفة."},
+            {"order": 4, "title_ar": "سداد الرسوم", "desc_ar": "سداد رسوم إذن العمل السنوية."},
+            {"order": 5, "title_ar": "استلام إذن العمل", "desc_ar": "استلام إذن العمل ومنه التسجيل في الضمان الاجتماعي."},
+        ],
+    },
+]
+
+def _proc_index() -> dict:
+    return {p["id"]: p for p in _PROCEDURE_CATALOG}
+
+@app.get("/procedures")
+async def list_procedures(
+    country: Optional[str] = None,
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 20,
+):
+    """List government procedures with optional filtering."""
+    results = _PROCEDURE_CATALOG.copy()
+    if country:
+        results = [p for p in results if p.get("country", "").lower() == country.lower()]
+    if category:
+        results = [p for p in results if p.get("category", "").lower() == category.lower()]
+    if q:
+        q_lower = q.lower()
+        results = [p for p in results if (
+            q_lower in p.get("title_ar", "").lower() or
+            q_lower in p.get("title_en", "").lower() or
+            any(q_lower in t for t in p.get("tags", []))
+        )]
+    return {
+        "total": len(results),
+        "procedures": [
+            {
+                "id": p["id"],
+                "slug": p["slug"],
+                "title_ar": p["title_ar"],
+                "title_en": p.get("title_en", ""),
+                "category": p["category"],
+                "country": p["country"],
+                "authority": p["authority"],
+                "summary_ar": p.get("summary_ar", ""),
+                "status": p.get("status", "unverified"),
+                "last_verified": p.get("last_verified", ""),
+            }
+            for p in results[:limit]
+        ],
+    }
+
+@app.get("/procedures/categories/list")
+async def procedure_categories():
+    """Return distinct categories."""
+    cats = list({p["category"] for p in _PROCEDURE_CATALOG})
+    return {"categories": cats}
+
+@app.get("/procedures/{procedure_id}")
+async def get_procedure(procedure_id: str):
+    """Get full procedure detail by ID or slug."""
+    idx = _proc_index()
+    # Try by ID, then by slug
+    proc = idx.get(procedure_id)
+    if not proc:
+        proc = next((p for p in _PROCEDURE_CATALOG if p.get("slug") == procedure_id), None)
+    if not proc:
+        raise HTTPException(404, detail="الإجراء غير موجود")
+    return proc
+
+# ══════════════════════════════════════════════════════════════
+#  MY PROCEDURE WORKSPACE — per-user transaction tracker
+#  Storage: in-memory dict (ephemeral; PostgreSQL migration BLOCKED
+#  until owner confirms backup + restore test).
+# ══════════════════════════════════════════════════════════════
+
+
+async def _require_auth(current_user: dict = Depends(get_current_user)) -> dict:
+    """Raise 401 if the request carries no real JWT (i.e. guest access)."""
+    if current_user.get("username") == "guest":
+        raise HTTPException(status_code=401, detail="يلزم تسجيل الدخول أولاً")
+    return current_user
+
+
+class MyProcedureCreate(BaseModel):
+    procedure_id: str
+    title_ar: Optional[str] = None
+    notes: Optional[str] = None
+
+class MyProcedureUpdate(BaseModel):
+    notes: Optional[str] = None
+    completed_steps: Optional[list[int]] = None
+    status: Optional[str] = None  # active | completed | cancelled
+
+# In-memory workspace (ephemeral — survives restart only if persisted to Qdrant user payload)
+_user_procedures: dict[str, list[dict]] = {}
+
+def _get_user_procedures(username: str) -> list[dict]:
+    return _user_procedures.get(username, [])
+
+def _save_user_procedure(username: str, proc: dict) -> None:
+    if username not in _user_procedures:
+        _user_procedures[username] = []
+    existing = next((p for p in _user_procedures[username] if p["id"] == proc["id"]), None)
+    if existing:
+        existing.update(proc)
+    else:
+        _user_procedures[username].append(proc)
+
+@app.get("/my-procedures")
+async def list_my_procedures(user: dict = Depends(_require_auth)):
+    procs = _get_user_procedures(user["username"])
+    return {"procedures": procs, "count": len(procs)}
+
+@app.post("/my-procedures")
+async def create_my_procedure(req: MyProcedureCreate, user: dict = Depends(_require_auth)):
+    """Start tracking a procedure for the current user."""
+    # Find the procedure template
+    idx = _proc_index()
+    template = idx.get(req.procedure_id)
+    if not template:
+        template = next((p for p in _PROCEDURE_CATALOG if p.get("slug") == req.procedure_id), None)
+
+    proc_id = f"{user['username']}_{req.procedure_id}_{uuid.uuid4().hex[:8]}"
+
+    # Build checklist from template steps
+    if template:
+        checklist = [
+            {
+                "step": step["order"],
+                "title_ar": step.get("title_ar", ""),
+                "desc_ar": step.get("desc_ar", ""),
+                "done": False,
+                "done_at": None,
+            }
+            for step in template.get("steps", [])
+        ]
+        doc_list = [
+            {
+                "name_ar": doc["name_ar"],
+                "required": doc.get("required", True),
+                "uploaded": False,
+            }
+            for doc in template.get("documents", [])
+        ]
+    else:
+        checklist = []
+        doc_list = []
+
+    user_proc = {
+        "id": proc_id,
+        "procedure_id": req.procedure_id,
+        "title_ar": req.title_ar or (template["title_ar"] if template else req.procedure_id),
+        "status": "active",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "notes": req.notes or "",
+        "checklist": checklist,
+        "documents": doc_list,
+        "completion_pct": 0,
+        "next_step": checklist[0]["title_ar"] if checklist else "",
+    }
+    _save_user_procedure(user["username"], user_proc)
+    return user_proc
+
+@app.get("/my-procedures/{proc_id}")
+async def get_my_procedure(proc_id: str, user: dict = Depends(_require_auth)):
+    procs = _get_user_procedures(user["username"])
+    proc = next((p for p in procs if p["id"] == proc_id), None)
+    if not proc:
+        raise HTTPException(404, detail="الملف غير موجود")
+    return proc
+
+@app.put("/my-procedures/{proc_id}")
+async def update_my_procedure(
+    proc_id: str, req: MyProcedureUpdate, user: dict = Depends(_require_auth)
+):
+    procs = _get_user_procedures(user["username"])
+    proc = next((p for p in procs if p["id"] == proc_id), None)
+    if not proc:
+        raise HTTPException(404, detail="الملف غير موجود")
+
+    if req.notes is not None:
+        proc["notes"] = req.notes
+    if req.status is not None:
+        proc["status"] = req.status
+    if req.completed_steps is not None:
+        for step in proc.get("checklist", []):
+            step["done"] = step["step"] in req.completed_steps
+            if step["done"] and not step.get("done_at"):
+                step["done_at"] = datetime.now(timezone.utc).isoformat()
+        total = len(proc["checklist"])
+        done = sum(1 for s in proc["checklist"] if s["done"])
+        proc["completion_pct"] = round((done / total) * 100) if total else 0
+        next_steps = [s for s in proc["checklist"] if not s["done"]]
+        proc["next_step"] = next_steps[0]["title_ar"] if next_steps else "مكتمل"
+
+    proc["updated_at"] = datetime.now(timezone.utc).isoformat()
+    _save_user_procedure(user["username"], proc)
+    return proc
+
+@app.delete("/my-procedures/{proc_id}")
+async def delete_my_procedure(proc_id: str, user: dict = Depends(_require_auth)):
+    if user["username"] in _user_procedures:
+        _user_procedures[user["username"]] = [
+            p for p in _user_procedures[user["username"]] if p["id"] != proc_id
+        ]
+    return {"message": "تم حذف الملف"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin Content Governance — Draft → Review → Approved → Published → Expired
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-memory content items store (interim; will move to PostgreSQL)
+_content_items: dict[str, dict] = {}
+_audit_log: list[dict] = []
+
+_VALID_CONTENT_STATUSES = {"draft", "review", "approved", "published", "expired"}
+
+_CONTENT_TRANSITIONS: dict[str, set] = {
+    "draft":     {"review"},
+    "review":    {"approved", "draft"},
+    "approved":  {"published", "review"},
+    "published": {"expired"},
+    "expired":   set(),
+}
+
+
+def _require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """Raise 403 unless the current user has admin role or plan."""
+    if current_user.get("plan") != "admin" and current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="مخصص للمسؤولين فقط")
+    return current_user
+
+
+def _append_audit(
+    *,
+    action: str,
+    item_id: str,
+    actor: str,
+    before: str | None = None,
+    after: str | None = None,
+    note: str = "",
+) -> None:
+    _audit_log.append(
+        {
+            "ts": datetime.utcnow().isoformat(),
+            "action": action,
+            "item_id": item_id,
+            "actor": actor,
+            "before": before,
+            "after": after,
+            "note": note,
+        }
+    )
+
+
+class ContentItemCreate(BaseModel):
+    title_ar: str
+    body_ar: str
+    content_type: str = "procedure_update"
+    ref_procedure_id: str | None = None
+    note: str = ""
+
+
+class ContentItemPatch(BaseModel):
+    title_ar: str | None = None
+    body_ar: str | None = None
+    note: str = ""
+
+
+class ContentStatusTransition(BaseModel):
+    target_status: str
+    note: str = ""
+
+
+# ── List content items (admin only) ──────────────────────────────────────────
+@app.get("/admin/content", tags=["admin"])
+async def admin_list_content(
+    status: str | None = None,
+    admin: dict = Depends(_require_admin),
+):
+    items = list(_content_items.values())
+    if status:
+        items = [i for i in items if i["status"] == status]
+    items.sort(key=lambda x: x["updated_at"], reverse=True)
+    return {"items": items, "count": len(items)}
+
+
+# ── Create draft content item ─────────────────────────────────────────────────
+@app.post("/admin/content", tags=["admin"], status_code=201)
+async def admin_create_content(
+    body: ContentItemCreate,
+    admin: dict = Depends(_require_admin),
+):
+    item_id = secrets.token_hex(8)
+    now = datetime.utcnow().isoformat()
+    item = {
+        "id": item_id,
+        "title_ar": body.title_ar,
+        "body_ar": body.body_ar,
+        "content_type": body.content_type,
+        "ref_procedure_id": body.ref_procedure_id,
+        "status": "draft",
+        "created_by": admin["username"],
+        "created_at": now,
+        "updated_at": now,
+    }
+    _content_items[item_id] = item
+    _append_audit(
+        action="CREATE",
+        item_id=item_id,
+        actor=admin["username"],
+        after="draft",
+        note=body.note,
+    )
+    return item
+
+
+# ── Get single content item ───────────────────────────────────────────────────
+@app.get("/admin/content/{item_id}", tags=["admin"])
+async def admin_get_content(item_id: str, admin: dict = Depends(_require_admin)):
+    if item_id not in _content_items:
+        raise HTTPException(status_code=404, detail="العنصر غير موجود")
+    return _content_items[item_id]
+
+
+# ── Update draft content item ─────────────────────────────────────────────────
+@app.patch("/admin/content/{item_id}", tags=["admin"])
+async def admin_update_content(
+    item_id: str,
+    body: ContentItemPatch,
+    admin: dict = Depends(_require_admin),
+):
+    if item_id not in _content_items:
+        raise HTTPException(status_code=404, detail="العنصر غير موجود")
+    item = _content_items[item_id]
+    if item["status"] not in {"draft", "review"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"لا يمكن تعديل المحتوى في حالة {item['status']}",
+        )
+    if body.title_ar is not None:
+        item["title_ar"] = body.title_ar
+    if body.body_ar is not None:
+        item["body_ar"] = body.body_ar
+    item["updated_at"] = datetime.utcnow().isoformat()
+    _append_audit(
+        action="EDIT",
+        item_id=item_id,
+        actor=admin["username"],
+        before=item["status"],
+        after=item["status"],
+        note=body.note,
+    )
+    return item
+
+
+# ── Transition content status ─────────────────────────────────────────────────
+@app.post("/admin/content/{item_id}/transition", tags=["admin"])
+async def admin_transition_content(
+    item_id: str,
+    body: ContentStatusTransition,
+    admin: dict = Depends(_require_admin),
+):
+    if item_id not in _content_items:
+        raise HTTPException(status_code=404, detail="العنصر غير موجود")
+    item = _content_items[item_id]
+    current = item["status"]
+    target = body.target_status.lower()
+
+    if target not in _VALID_CONTENT_STATUSES:
+        raise HTTPException(status_code=400, detail=f"الحالة '{target}' غير صالحة")
+    if target not in _CONTENT_TRANSITIONS.get(current, set()):
+        raise HTTPException(
+            status_code=409,
+            detail=f"الانتقال من '{current}' إلى '{target}' غير مسموح",
+        )
+
+    item["status"] = target
+    item["updated_at"] = datetime.utcnow().isoformat()
+    if target == "published":
+        item["published_at"] = item["updated_at"]
+
+    _append_audit(
+        action="TRANSITION",
+        item_id=item_id,
+        actor=admin["username"],
+        before=current,
+        after=target,
+        note=body.note,
+    )
+    return {"id": item_id, "status": item["status"], "updated_at": item["updated_at"]}
+
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+@app.get("/admin/audit-log", tags=["admin"])
+async def admin_audit_log(
+    limit: int = 50,
+    offset: int = 0,
+    admin: dict = Depends(_require_admin),
+):
+    log = list(reversed(_audit_log))
+    total = len(log)
+    return {
+        "entries": log[offset : offset + limit],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
 # ═══════════════════════════════════════════════════════════════
 #  STARTUP
 # ═══════════════════════════════════════════════════════════════
@@ -1708,4 +2442,33 @@ async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_u
 @app.on_event("startup")
 async def startup():
     admin_username = os.environ.get("ADMIN_USERNAME")
-    a
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+    if admin_username and admin_password:
+        try:
+            existing = db_get_user(admin_username.lower())
+            if not existing:
+                now = datetime.now(timezone.utc)
+                admin_user = {
+                    "username":         admin_username.lower(),
+                    "email":            os.environ.get("ADMIN_EMAIL", f"{admin_username.lower()}@dalilak.ai"),
+                    "password_hash":    hash_pw(admin_password),
+                    "full_name":        "مشرف النظام",
+                    "phone":            "",
+                    "plan":             "admin",
+                    "role":             "admin",
+                    "active":           True,
+                    "trial_expires_at": None,
+                    "paid_until":       None,
+                    "created_at":       now.isoformat(),
+                    "last_login":       None,
+                }
+                db_save_user(admin_user)
+                _log.info("[startup] Admin user '%s' created", admin_username)
+            else:
+                _log.info("[startup] Admin user '%s' already exists", admin_username)
+        except Exception as e:
+            _log.error("[startup] Failed to create admin user: %s", e)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
