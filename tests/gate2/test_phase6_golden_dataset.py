@@ -3,9 +3,7 @@ from __future__ import annotations
 import json, os
 import pytest
 
-_DATASET_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "datasets", "golden_v1.json"
-)
+_DATASET_PATH = os.path.join(os.path.dirname(__file__), "golden_v1.json")
 
 @pytest.fixture(scope="module")
 def dataset():
@@ -16,119 +14,98 @@ def dataset():
 def items(dataset):
     return dataset["items"]
 
-# ── Schema tests ───────────────────────────────────────────────────────────────
-
 @pytest.mark.tier_a
 def test_p6_a1_file_exists():
-    assert os.path.exists(_DATASET_PATH), f"Dataset not found: {_DATASET_PATH}"
+    assert os.path.exists(_DATASET_PATH)
 
 @pytest.mark.tier_a
 def test_p6_a2_version_field(dataset):
-    assert "version" in dataset
-    assert dataset["version"] >= 1
+    assert dataset.get("version", 0) >= 1
 
 @pytest.mark.tier_a
 def test_p6_a3_minimum_item_count(items):
-    assert len(items) >= 150, f"Expected >=150 items, got {len(items)}"
+    assert len(items) >= 150
 
 @pytest.mark.tier_a
 def test_p6_a4_required_fields(items):
     required = {"id", "query", "should_pass_gate", "expected_keywords", "category"}
     for item in items:
-        missing = required - set(item.keys())
-        assert not missing, f"Item {item.get('id')} missing fields: {missing}"
+        assert not (required - set(item.keys())), f"Item {item.get('id')} missing fields"
 
 @pytest.mark.tier_a
 def test_p6_a5_unique_ids(items):
     ids = [i["id"] for i in items]
-    assert len(ids) == len(set(ids)), "Duplicate IDs in dataset"
+    assert len(ids) == len(set(ids))
 
 @pytest.mark.tier_a
 def test_p6_a6_queries_non_empty(items):
     for item in items:
-        assert item["query"].strip(), f"Item {item['id']} has empty query"
+        assert item["query"].strip(), f"Empty query: {item['id']}"
 
 @pytest.mark.tier_a
 def test_p6_a7_bool_gate_field(items):
     for item in items:
-        assert isinstance(item["should_pass_gate"], bool), \
-            f"Item {item['id']} should_pass_gate is not bool"
+        assert isinstance(item["should_pass_gate"], bool), f"{item['id']} gate not bool"
 
 @pytest.mark.tier_a
 def test_p6_a8_keywords_are_list(items):
     for item in items:
-        assert isinstance(item["expected_keywords"], list), \
-            f"Item {item['id']} expected_keywords is not a list"
-
-# ── Coverage tests ─────────────────────────────────────────────────────────────
+        assert isinstance(item["expected_keywords"], list), f"{item['id']} keywords not list"
 
 @pytest.mark.tier_a
 def test_p6_a9_positive_items_majority(items):
-    positive = sum(1 for i in items if i["should_pass_gate"])
-    assert positive >= 100, f"Expected >=100 positive items, got {positive}"
+    assert sum(1 for i in items if i["should_pass_gate"]) >= 100
 
 @pytest.mark.tier_a
 def test_p6_a10_negative_items_present(items):
-    negative = sum(1 for i in items if not i["should_pass_gate"])
-    assert negative >= 10, f"Expected >=10 negative (out-of-scope) items, got {negative}"
+    assert sum(1 for i in items if not i["should_pass_gate"]) >= 10
 
 @pytest.mark.tier_a
 def test_p6_a11_category_diversity(items):
-    categories = {i["category"] for i in items}
-    assert len(categories) >= 10, f"Expected >=10 categories, got {len(categories)}"
+    assert len({i["category"] for i in items}) >= 10
 
 @pytest.mark.tier_a
 def test_p6_a12_positive_items_have_keywords(items):
     for item in items:
         if item["should_pass_gate"]:
-            assert len(item["expected_keywords"]) >= 1, \
-                f"Positive item {item['id']} has no expected_keywords"
+            assert len(item["expected_keywords"]) >= 1, f"Positive {item['id']} has no keywords"
 
 @pytest.mark.tier_a
 def test_p6_a13_arabic_queries(items):
-    # At least 80% of positive queries should contain Arabic characters
-    arabic_range = range(0x0600, 0x06FF)
-    def has_arabic(s):
-        return any(ord(c) in arabic_range for c in s)
+    def has_arabic(s): return any(0x0600 <= ord(c) <= 0x06FF for c in s)
     pos = [i for i in items if i["should_pass_gate"]]
-    arabic_count = sum(1 for i in pos if has_arabic(i["query"]))
-    assert arabic_count / len(pos) >= 0.8, \
-        f"Less than 80% of positive queries are Arabic ({arabic_count}/{len(pos)})"
+    arabic = sum(1 for i in pos if has_arabic(i["query"]))
+    assert arabic / len(pos) >= 0.8
 
 @pytest.mark.tier_a
 def test_p6_a14_no_duplicate_queries(items):
     queries = [i["query"].strip() for i in items]
-    assert len(queries) == len(set(queries)), "Duplicate queries found in dataset"
+    assert len(queries) == len(set(queries))
 
 @pytest.mark.tier_a
 def test_p6_a15_personal_status_coverage(items):
-    cats = {i["category"] for i in items}
-    assert "أحوال_شخصية" in cats, "Missing أحوال_شخصية category"
+    assert "أحوال_شخصية" in {i["category"] for i in items}
 
 @pytest.mark.tier_a
 def test_p6_a16_legal_coverage(items):
-    legal_cats = {i["category"] for i in items if "قضاء" in i["category"] or "قانون" in i["category"]}
-    assert len(legal_cats) >= 3, f"Insufficient legal categories: {legal_cats}"
+    legal = {i["category"] for i in items if "قضاء" in i["category"] or "قانون" in i["category"]}
+    assert len(legal) >= 3
 
 @pytest.mark.tier_a
 def test_p6_a17_labor_coverage(items):
-    cats = {i["category"] for i in items}
-    assert "عمل" in cats, "Missing عمل (labor) category"
+    assert "عمل" in {i["category"] for i in items}
 
 @pytest.mark.tier_a
 def test_p6_a18_banking_coverage(items):
-    cats = {i["category"] for i in items}
-    assert "مصارف" in cats, "Missing مصارف (banking) category"
+    assert "مصارف" in {i["category"] for i in items}
 
 @pytest.mark.tier_a
 def test_p6_a19_cnss_coverage(items):
     cnss = [i for i in items if "CNSS" in " ".join(i["expected_keywords"]) or "ضمان" in i["query"]]
-    assert len(cnss) >= 3, "Insufficient CNSS/social-security coverage"
+    assert len(cnss) >= 3
 
 @pytest.mark.tier_a
-def test_p6_a20_out_of_scope_categories_marked(items):
-    out = [i for i in items if "OUT_OF_SCOPE" in i["category"]]
-    assert len(out) >= 10
-    for item in out:
-        assert item["should_pass_gate"] is False, \
-            f"OUT_OF_SCOPE item {item['id']} incorrectly marked should_pass_gate=True"
+def test_p6_a20_out_of_scope_marked_false(items):
+    for item in items:
+        if "OUT_OF_SCOPE" in item["category"]:
+            assert item["should_pass_gate"] is False, f"{item['id']} out-of-scope but gate=True"
