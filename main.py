@@ -185,6 +185,7 @@ APP_BASE_URL      = os.environ.get("APP_BASE_URL", "https://dalilak-frontend.ver
 
 from rate_limit    import enforce         as _rate_enforce     # noqa: E402
 from email_service import send_reset_email as _send_reset_email  # noqa: E402
+from plan_quota    import check_and_increment as _check_quota   # Phase 10  # noqa: E402
 
 # ── JWT_SECRET startup validation ─────────────────────────────────────────────
 # Must fire before any external service client (Qdrant, OpenAI, …) is created.
@@ -1319,6 +1320,7 @@ async def admin_knowledge_extract(req: FileExtractRequest, admin: dict = Depends
 @app.post("/chat")
 async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
     await _rate_enforce(request, "chat", user_id=user["username"])
+    await _check_quota(user["username"], user.get("plan", "trial"))   # Phase 10
     ck = _ck(req.message, req.domain)
     cached = _cget(ck)
     if cached:
@@ -1356,6 +1358,7 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(get_current_user)):
     await _rate_enforce(request, "chat", user_id=user["username"])
+    await _check_quota(user["username"], user.get("plan", "trial"))   # Phase 10
     async def generate() -> AsyncGenerator[str, None]:
         try:
             t0 = time.time()
