@@ -1,0 +1,41 @@
+name: Backend CI
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+    branches: ["master", "main"]
+
+jobs:
+  test:
+    name: pytest (Gate 2 — JWT validation)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install runtime + test dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-test.txt
+
+      - name: Run tests
+        # Tests run from the backend root so 'import main' and 'import config' resolve.
+        # JWT_SECRET is intentionally NOT set here — the tests verify startup failure
+        # with the known default and use isolated envs for subprocess tests.
+        # No live network calls; all external service addresses are unreachable ports.
+        run: pytest tests/ -v --tb=short
+
+      - name: Verify config.py has no live secrets
+        run: |
+          # config.py must not contain real API keys or tokens
+          if grep -qE '(sk-proj-|eyJhbGci|Bearer [a-zA-Z0-9]{20})' config.py; then
+            echo "FAIL: config.py appears to contain a live credential"
+            exit 1
+          fi
+          echo "PASS: no live credentials in config.py"
