@@ -162,7 +162,8 @@ EMBED_MODEL    = "text-embedding-3-large"
 VECTOR_DIM     = 3072
 MODEL_FAST     = "gpt-4o-mini"
 MODEL_SMART    = "gpt-4o"
-MIN_SCORE      = 0.28
+MIN_SCORE           = 0.28   # Qdrant retrieval floor (chunks below this are never returned)
+SUFFICIENCY_TOP_SCORE = 0.35  # Phase 5 gate: top chunk must reach this to proceed to GPT
 MAX_CTX        = 12
 MAX_TOKENS     = 2000
 MAX_HISTORY    = 6
@@ -612,6 +613,27 @@ def build_messages(ctx: str, history: list, user_msg: str) -> list:
         msgs.append({"role": m.role, "content": m.content})
     msgs.append({"role": "user", "content": user_msg})
     return msgs
+
+# ── Phase 5: Evidence Sufficiency Gate ────────────────────────────────────────
+# If no retrieved chunk clears SUFFICIENCY_TOP_SCORE we refuse to call GPT and
+# return a fixed "no evidence" message instead of hallucinating general knowledge.
+
+SUFFICIENCY_MSG = (
+    "لم أجد في قاعدة بيانات دليلك معلومات كافية تُغطّي هذا السؤال تحديداً. "
+    "أنصحك بالتواصل مع الجهة الحكومية المختصة مباشرةً للحصول على إجابة دقيقة."
+)
+
+def _is_evidence_sufficient(chunks: list) -> bool:
+    """Return True only when at least one chunk scores >= SUFFICIENCY_TOP_SCORE.
+
+    Design note:
+    - MIN_SCORE (0.28) is the Qdrant floor — chunks below it are never returned.
+    - SUFFICIENCY_TOP_SCORE (0.35) is a stricter gate applied AFTER retrieval.
+      A query can return many low-scoring chunks that are tangentially related;
+      the gate ensures the best match is semantically close enough to trust.
+    """
+    return any(c.get("score", 0) >= SUFFICIENCY_TOP_SCORE for c in chunks)
+# ──────────────────────────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════════════
 #  PUBLIC ENDPOINTS
@@ -1213,6 +1235,13 @@ async def chat(req: ChatRequest, request: Request, user: dict = Depends(get_curr
     t0 = time.time()
     vec    = await embed(req.message)
     chunks = await search_qdrant(vec, req.domain)
+
+    # ── Phase 5 evidence gate ──────────────────────────────────────────────────
+    if not _is_evidence_sufficient(chunks):
+        return {"answer": SUFFICIENCY_MSG, "model": "gate", "chunks_used": 0,
+                "elapsed_s": round(time.time() - t0, 2), "sources": []}
+    # ──────────────────────────────────────────────────────────────────────────
+
     ctx    = context_str(chunks)
     model  = pick_model(req.message)
     msgs   = build_messages(ctx, req.history, req.message)
@@ -1240,6 +1269,15 @@ async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(g
             t0 = time.time()
             vec    = await embed(req.message)
             chunks = await search_qdrant(vec, req.domain)
+
+            # ── Phase 5 evidence gate ──────────────────────────────────────────
+            if not _is_evidence_sufficient(chunks):
+                gate_ev = {"type": "gate", "answer": SUFFICIENCY_MSG, "sources": []}
+                yield f"data: {json.dumps(gate_ev, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            # ──────────────────────────────────────────────────────────────────
+
             ctx    = context_str(chunks)
             model  = pick_model(req.message)
             msgs   = build_messages(ctx, req.history, req.message)
