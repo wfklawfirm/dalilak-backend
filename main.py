@@ -298,6 +298,25 @@ def _cset(key: str, val: dict) -> None:
         _cache.popitem(last=False)
 
 # ═══════════════════════════════════════════════════════════════
+#  FLOWCHART CACHE (AI-generated procedure maps, keyed by slug)
+# ═══════════════════════════════════════════════════════════════
+
+_FC_CACHE_MAX = 500
+_flowchart_cache: OrderedDict[str, dict] = OrderedDict()
+
+def _fcget(key: str) -> Optional[dict]:
+    v = _flowchart_cache.get(key)
+    if v:
+        _flowchart_cache.move_to_end(key)
+    return v
+
+def _fcset(key: str, val: dict) -> None:
+    _flowchart_cache[key] = val
+    _flowchart_cache.move_to_end(key)
+    while len(_flowchart_cache) > _FC_CACHE_MAX:
+        _flowchart_cache.popitem(last=False)
+
+# ═══════════════════════════════════════════════════════════════
 #  PASSWORD HELPERS
 # ═══════════════════════════════════════════════════════════════
 
@@ -708,6 +727,18 @@ class AnalyzeRequest(BaseModel):
 class SuggestFollowupRequest(BaseModel):
     question: str
     answer: str
+
+class FlowchartGenerateRequest(BaseModel):
+    slug: str
+    titleAr: str
+    titleEn: Optional[str] = None
+    category: Optional[str] = None
+    authority: Optional[str] = None
+    fees: Optional[str] = None
+    processingTime: Optional[str] = None
+    requiredDocuments: list[str] = []
+    descriptionAr: Optional[str] = None
+    knownSteps: list[str] = []
 
 class RegisterRequest(BaseModel):
     username: str
@@ -1852,6 +1883,178 @@ async def suggest_followup(req: SuggestFollowupRequest, request: Request, user: 
         _log.warning("suggest_followup failed: %s", exc)
         questions = []
     return {"questions": questions}
+
+
+_FLOWCHART_NODE_TYPES = {
+    "start", "question", "document", "action", "authority",
+    "risk", "draft", "human_review", "completion", "warning",
+}
+_FLOWCHART_RISK_LEVELS = {"low", "medium", "high", "critical"}
+
+
+@app.post("/flowchart/generate")
+async def flowchart_generate(req: FlowchartGenerateRequest, request: Request, user: dict = Depends(get_current_user)):
+    """توليد خارطة إجراء (Flowchart) احترافية بالذكاء الاصطناعي لأي خدمة/معاملة، مع تخزين مؤقت بالذاكرة حسب الـ slug."""
+    cache_key = hashlib.md5(req.slug.strip().lower().encode()).hexdigest()
+    cached = _fcget(cache_key)
+    if cached:
+        return cached
+
+    await _rate_enforce(request, "flowchart", user_id=user["username"])
+    await _check_quota(_guest_quota_key(user, request), user.get("plan", "guest"))
+
+    docs_line = "، ".join(req.requiredDocuments[:12]) if req.requiredDocuments else "غير محدد"
+    steps_block = ""
+    if req.knownSteps:
+        steps_lines = "\n".join(f"- {s}" for s in req.knownSteps[:20])
+        steps_block = f"\n- خطوات معروفة من مصدر موثوق (استخدمها كأساس ولا تخترع خطوات تناقضها):\n{steps_lines}"
+
+    # ── تأصيل الخارطة بأدلة حقيقية من قاعدة المعرفة (Qdrant) ──
+    # الهدف: منع النموذج من اختراع خطوات لا يدعمها مصدر — نطلب منه أن يشير صراحة
+    # إلى رقم المصدر الذي استند إليه لكل عقدة (sourceIndexes)، ثم نحل هذه الأرقام
+    # لاحقاً إلى مصادر حقيقية من نتائج الاسترجاع نفسها (لا نثق بأي رابط يكتبه النموذج مباشرة).
+    search_query = f"{req.titleAr} {req.category or ''} {req.authority or ''}".strip()
+    try:
+        vec = await embed(search_query)
+        raw_chunks = await search_qdrant(vec)
+    except Exception as exc:
+        _log.warning("flowchart_generate: qdrant retrieval failed for slug=%s: %s", req.slug, exc)
+        raw_chunks = []
+    evidence_chunks = _mmr_deduplicate(raw_chunks, k=8) if raw_chunks else []
+    ctx = context_str(raw_chunks)
+    grounded = len(evidence_chunks) > 0
+
+    evidence_instructions = (
+        'لكل عقدة إجرائية (باستثناء start/completion)، أضف حقل sourceIndexes وهو مصفوفة أرقام صحيحة تشير حصراً '
+        'إلى أرقام المصادر [1][2]... الواردة أعلاه إن استخدمتها لبناء هذه الخطوة، وإلا اتركها مصفوفة فارغة. '
+        'أضف أيضاً حقل confidence بقيمة "high" إن استندت العقدة مباشرة إلى مصدر مسترجع، أو "medium" إن كانت '
+        'استنتاجاً منطقياً من معطيات المعاملة المُعطاة، أو "low" إن لم يكن هناك أي دعم مباشر. '
+        'لا تخترع أرقام مصادر غير موجودة في القائمة.'
+        if grounded else
+        'لا توجد مصادر مسترجعة موثوقة لهذه المعاملة، لذا اجعل حقل sourceIndexes مصفوفة فارغة لكل عقدة، وحقل '
+        'confidence "low" لكل العقد الإجرائية، واعتمد فقط على المعطيات العامة المعطاة أعلاه دون تفاصيل دقيقة '
+        '(كأرقام رسوم محددة) لا تملك دليلاً عليها.'
+    )
+
+    prompt = f"""أنت خبير في تصميم خرائط إجراءات (Flowcharts) احترافية للمعاملات الحكومية اللبنانية.
+
+معطيات المعاملة:
+- العنوان: {req.titleAr}
+- الفئة: {req.category or "غير محدد"}
+- الجهة المختصة: {req.authority or "غير محدد"}
+- الرسوم: {req.fees or "غير محدد"}
+- المدة التقديرية: {req.processingTime or "غير محدد"}
+- المستندات المطلوبة: {docs_line}{steps_block}
+{(chr(10) + ctx + chr(10)) if ctx else ""}
+المطلوب: أنشئ خارطة إجراء منطقية ومتسلسلة من 5 إلى 9 عقد (nodes) تمثل رحلة المواطن الكاملة من البداية حتى الاكتمال، مع ربطها بحواف (edges) منطقية.
+استخدم فقط أنواع العقد التالية حصراً: start, question, document, action, authority, risk, draft, human_review, completion, warning
+
+قواعد إلزامية:
+1. أول عقدة من نوع "start" وآخر عقدة من نوع "completion".
+2. إن وُجدت مستندات مطلوبة، أضف عقدة واحدة على الأقل من نوع "document" مع requiredDocuments.
+3. إن وُجدت جهة مختصة، أضف عقدة من نوع "authority".
+4. إن وُجد خطر واقعي (رسوم مرتفعة، مهل قانونية، وثائق حساسة، احتيال شائع)، أضف عقدة من نوع "risk" بوصف دقيق.
+5. كل عقدة: id فريد قصير بالإنكليزية (snake_case)، type، titleAr وtitleEn دقيقين ومهنيين، descriptionAr مختصر عند الحاجة.
+6. اربط العقد بحواف edges منطقية بالترتيب الصحيح، مع labelAr عند وجود تفرّع (سؤال بنعم/لا مثلاً).
+7. {evidence_instructions}
+
+أجب بصيغة JSON فقط بهذا الشكل الدقيق (بدون أي نص إضافي خارج الـ JSON):
+{{"titleAr": "...", "titleEn": "...", "estimatedDurationAr": "...", "estimatedDurationEn": "...",
+"nodes": [{{"id": "start", "type": "start", "titleAr": "...", "titleEn": "...", "descriptionAr": "...", "sourceIndexes": [], "confidence": "medium"}}],
+"edges": [{{"id": "e1", "from": "start", "to": "...", "labelAr": "..."}}]}}"""
+
+    try:
+        resp = await oai().chat.completions.create(
+            model=MODEL_SMART,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1400,
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        nodes_in = data.get("nodes") or []
+        edges_in = data.get("edges") or []
+
+        # تحقق وتصحيح صارم قبل الإرسال للواجهة — لا نثق بمخرجات النموذج كما هي
+        seen_ids: set = set()
+        nodes: list[dict] = []
+        for i, n in enumerate(nodes_in):
+            nid = str(n.get("id") or f"n{i}")
+            if nid in seen_ids:
+                nid = f"{nid}_{i}"
+            seen_ids.add(nid)
+            ntype = n.get("type") if n.get("type") in _FLOWCHART_NODE_TYPES else "action"
+
+            # حلّ sourceIndexes إلى مصادر حقيقية من نتائج الاسترجاع نفسها — لا نثق بأي
+            # عنوان أو رابط قد يكتبه النموذج مباشرة في حقول أخرى غير هذه الأرقام
+            raw_idx = n.get("sourceIndexes")
+            idxs = [x for x in raw_idx if isinstance(x, int)] if isinstance(raw_idx, list) else []
+            source_refs: list[dict] = []
+            seen_titles: set = set()
+            for idx in idxs:
+                if 1 <= idx <= len(evidence_chunks):
+                    c = evidence_chunks[idx - 1]
+                    if c["title"] and c["title"] not in seen_titles:
+                        seen_titles.add(c["title"])
+                        source_refs.append({"title": c["title"], "website": c.get("website") or None})
+
+            confidence = n.get("confidence") if n.get("confidence") in {"low", "medium", "high"} else ("medium" if grounded else "low")
+            if not source_refs and confidence == "high":
+                confidence = "medium"  # لا ثقة عالية بلا مصدر فعلي محلول
+
+            nodes.append({
+                "id": nid,
+                "type": ntype,
+                "titleAr": n.get("titleAr") or n.get("title") or "خطوة",
+                "titleEn": n.get("titleEn"),
+                "descriptionAr": n.get("descriptionAr"),
+                "descriptionEn": n.get("descriptionEn"),
+                "status": "current" if i == 0 else "not_started",
+                "riskLevel": n.get("riskLevel") if n.get("riskLevel") in _FLOWCHART_RISK_LEVELS else None,
+                "requiredDocuments": n.get("requiredDocuments") if isinstance(n.get("requiredDocuments"), list) else None,
+                "relatedAuthority": n.get("relatedAuthority"),
+                "sourceRefs": source_refs or None,
+                "confidence": None if ntype in {"start", "completion"} else confidence,
+            })
+        if nodes and nodes[0]["type"] != "start":
+            nodes[0]["type"] = "start"
+        if nodes and nodes[-1]["type"] != "completion":
+            nodes[-1]["type"] = "completion"
+
+        valid_ids = {n["id"] for n in nodes}
+        edges: list[dict] = []
+        for i, e in enumerate(edges_in):
+            f, t = e.get("from"), e.get("to")
+            if f in valid_ids and t in valid_ids:
+                edges.append({"id": e.get("id") or f"e{i}", "from": f, "to": t, "labelAr": e.get("labelAr")})
+
+        # خطة احتياطية: إن لم تصل أي حواف صالحة، اربط العقد تسلسلياً
+        if not edges and len(nodes) > 1:
+            edges = [{"id": f"e{i}", "from": nodes[i]["id"], "to": nodes[i + 1]["id"]} for i in range(len(nodes) - 1)]
+
+        if not nodes:
+            raise ValueError("empty nodes from model")
+
+        flowchart = {
+            "procedureSlug": req.slug,
+            "titleAr": data.get("titleAr") or req.titleAr,
+            "titleEn": data.get("titleEn") or req.titleEn or req.titleAr,
+            "country": "lebanon",
+            "version": "ai-1.0",
+            "verificationStatus": "draft",
+            "estimatedDurationAr": data.get("estimatedDurationAr") or req.processingTime,
+            "estimatedDurationEn": data.get("estimatedDurationEn"),
+            "nodes": nodes,
+            "edges": edges,
+            "generatedBy": "ai",
+            "groundedInSources": grounded,
+        }
+    except Exception as exc:
+        _log.warning("flowchart_generate failed for slug=%s: %s", req.slug, exc)
+        raise HTTPException(502, detail="تعذّر توليد خارطة الإجراء حالياً، حاول مجدداً")
+
+    _fcset(cache_key, flowchart)
+    return flowchart
 
 
 @app.post("/analyze/stream")

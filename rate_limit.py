@@ -209,6 +209,13 @@ _POLICIES: dict[str, dict[str, tuple[int, int]]] = {
         "user":        (3600, 150),   # L4: 150/hour per user
         "user_ep":     (3600, 100),
     },
+    "flowchart": {
+        "ip":          (60,   120),
+        "ip_ep":       (60,    15),   # L2: 15 flowchart generations/min per IP
+        "ep":          (60,   300),
+        "user":        (3600, 120),   # L4: 120/hour per user
+        "user_ep":     (3600,  80),
+    },
 }
 
 
@@ -222,7 +229,7 @@ async def enforce(
     Raises HTTPException(429) if any layer is exceeded.
 
     endpoint: one of "login", "register", "forgot", "chat", "reset",
-              "analyze", "suggest_followup"
+              "analyze", "suggest_followup", "flowchart"
     user_id:  authenticated username, or None for unauthenticated endpoints
     """
     policy = _POLICIES.get(endpoint, {})
