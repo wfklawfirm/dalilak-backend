@@ -27,7 +27,7 @@ def _make_main_module(redis_url: str = ""):
     """
     import os
     with patch.dict(os.environ, {"REDIS_URL": redis_url,
-                                  "JWT_SECRET": "test-secret-safe-32chars-xyzxyz",
+                                  "JWT_SECRET": "test-secret-safe-32chars-xyzxyzz",
                                   "QDRANT_URL": "http://localhost:6333",
                                   "RESEND_API_KEY": "re_test"}):
         if "main" in sys.modules:

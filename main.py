@@ -177,6 +177,11 @@ MAX_DOC_TOKENS = 3500
 QDRANT_TIMEOUT_SEC  = 10    # Qdrant vector search must complete within 10 s
 OPENAI_TIMEOUT_SEC  = 60    # OpenAI completions must complete within 60 s
 MAX_MESSAGE_LEN     = 4000  # Max chars in a single user message (prevents token flood)
+# P0 security audit (2026-07): /analyze/stream had no upload size limit —
+# base64.b64decode() and downstream PDF/DOCX/XLSX/PPTX/zip parsers ran on
+# arbitrarily large payloads. 20 MB base64 (~15 MB raw file) covers scanned
+# multi-page documents while bounding worst-case memory/CPU per request.
+MAX_ANALYZE_BASE64_LEN = 20 * 1024 * 1024
 
 # Auth config
 JWT_SECRET   = os.environ.get("JWT_SECRET", "dalilak-secret-CHANGE-IN-PROD")
@@ -193,15 +198,34 @@ from rate_limit    import enforce         as _rate_enforce     # noqa: E402
 from email_service import send_reset_email as _send_reset_email  # noqa: E402
 from plan_quota    import check_and_increment as _check_quota   # Phase 10  # noqa: E402
 
-# ── JWT_SECRET startup validation ─────────────────────────────────────────────
+# ── JWT_SECRET / ADMIN_SECRET startup validation ──────────────────────────────
 # Must fire before any external service client (Qdrant, OpenAI, …) is created.
-# SECURITY: JWT_SECRET value is never logged, printed, or included in output.
-from config import validate_security_configuration as _validate_cfg, ConfigurationError as _CfgError  # noqa: E402
+# SECURITY: secret values are never logged, printed, or included in output.
+from config import (       # noqa: E402
+    validate_security_configuration as _validate_cfg,
+    validate_admin_secret_configuration as _validate_admin_cfg,
+    ConfigurationError as _CfgError,
+)
 try:
     _validate_cfg(JWT_SECRET)
 except _CfgError as _exc:
     sys.stderr.write(str(_exc) + "\n")
     sys.exit(1)
+try:
+    # NON-FATAL for now: verify_admin_secret() is currently dead code (not
+    # wired via Depends anywhere per the P0 security audit), and we cannot
+    # confirm from here whether the live Render ADMIN_SECRET value already
+    # meets the new length/default checks. Hard-failing startup on an unused
+    # variable risks taking down production on a value we can't verify.
+    # Warn loudly instead; escalate to sys.exit(1) once ADMIN_SECRET is
+    # either confirmed strong in Render or the dead code path is removed.
+    _validate_admin_cfg(ADMIN_SECRET)
+except _CfgError as _exc:
+    sys.stderr.write(
+        "[WARNING] " + str(_exc).replace("[FATAL]", "").strip() +
+        " (non-fatal: ADMIN_SECRET is currently unused dead code — "
+        "see P0 security audit. Rotate it in Render regardless.)\n"
+    )
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Qdrant collections for users & logs
@@ -1188,7 +1212,10 @@ async def forgot_password(req: ForgotPasswordRequest, request: Request):
     return _SAFE_RESPONSE
 
 @app.post("/auth/reset-password")
-async def reset_password(req: ResetPasswordRequest):
+async def reset_password(req: ResetPasswordRequest, request: Request):
+    # P0 security audit (2026-07): this endpoint had zero rate limiting,
+    # allowing unlimited guesses against reset tokens. Added.
+    await _rate_enforce(request, "reset")
     if len(req.new_password) < 8:  # Phase 8: raised from 6 to 8
         raise HTTPException(400, detail="كلمة المرور يجب أن تكون 8 أحرف على الأقل")
     # Hash the raw token before lookup — the DB stores only hashes, never raw tokens
@@ -1797,8 +1824,13 @@ async def chat_stream(req: ChatRequest, request: Request, user: dict = Depends(g
 
 
 @app.post("/suggest_followup")
-async def suggest_followup(req: SuggestFollowupRequest, user: dict = Depends(get_current_user)):
+async def suggest_followup(req: SuggestFollowupRequest, request: Request, user: dict = Depends(get_current_user)):
     """Generate 3 follow-up questions based on the Q&A exchange."""
+    # P0 security audit (2026-07): previously no rate limit and no quota
+    # check — a trial/guest user could call this OpenAI-backed endpoint
+    # unlimited times, bypassing the daily message quota entirely.
+    await _rate_enforce(request, "suggest_followup", user_id=user["username"])
+    await _check_quota(_guest_quota_key(user, request), user.get("plan", "guest"))
     prompt = (
         f'السؤال الأصلي: "{req.question[:300]}"\n'
         f'ملخص الإجابة: "{req.answer[:600]}"\n\n'
@@ -1823,7 +1855,14 @@ async def suggest_followup(req: SuggestFollowupRequest, user: dict = Depends(get
 
 
 @app.post("/analyze/stream")
-async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_user)):
+async def analyze_stream(req: AnalyzeRequest, request: Request, user: dict = Depends(get_current_user)):
+    # P0 security audit (2026-07): previously no rate limit, no quota check,
+    # and no upload size limit before base64.b64decode() + document parsing.
+    await _rate_enforce(request, "analyze", user_id=user["username"])
+    await _check_quota(_guest_quota_key(user, request), user.get("plan", "guest"))
+    if len(req.file_base64) > MAX_ANALYZE_BASE64_LEN:
+        raise HTTPException(400, detail="حجم الملف كبير جداً — الحد الأقصى ~15 ميغابايت")
+
     async def generate() -> AsyncGenerator[str, None]:
         try:
             fname_lower = req.file_name.lower()

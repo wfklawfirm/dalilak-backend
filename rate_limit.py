@@ -187,6 +187,28 @@ _POLICIES: dict[str, dict[str, tuple[int, int]]] = {
         "user":        (3600, 200),   # L4: 200 chat/hour per user
         "user_ep":     (3600, 100),   # L5: 100 chat/hour per user per endpoint
     },
+    # P0 security audit (2026-07): the three policies below close gaps found
+    # by the audit — /auth/reset-password, /analyze/stream and
+    # /suggest_followup previously had zero rate limiting.
+    "reset":     {
+        "ip":          (60,   120),
+        "ip_ep":       (900,    5),   # L2: 5 reset attempts / 15 min per IP (token-guessing defense)
+        "ep":          (60,    60),
+    },
+    "analyze":   {
+        "ip":          (60,   120),   # L1
+        "ip_ep":       (60,    10),   # L2: 10 analyze calls/min per IP (parses untrusted files, costs OpenAI)
+        "ep":          (60,   300),   # L3: 300 analyze/min globally
+        "user":        (3600,  60),   # L4: 60 analyze/hour per user
+        "user_ep":     (3600,  40),   # L5: 40 analyze/hour per user per endpoint
+    },
+    "suggest_followup": {
+        "ip":          (60,   120),
+        "ip_ep":       (60,    20),   # L2: 20 calls/min per IP
+        "ep":          (60,   500),
+        "user":        (3600, 150),   # L4: 150/hour per user
+        "user_ep":     (3600, 100),
+    },
 }
 
 
@@ -199,7 +221,8 @@ async def enforce(
     Enforce all applicable rate-limit layers for the given endpoint.
     Raises HTTPException(429) if any layer is exceeded.
 
-    endpoint: one of "login", "register", "forgot", "chat"
+    endpoint: one of "login", "register", "forgot", "chat", "reset",
+              "analyze", "suggest_followup"
     user_id:  authenticated username, or None for unauthenticated endpoints
     """
     policy = _POLICIES.get(endpoint, {})
