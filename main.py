@@ -7,6 +7,7 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -35,6 +36,12 @@ from retrieval_service import RetrievalService
 from database import init_db, db_session, repo
 from risk_service import compute_risk
 from document_service import analyze_document, review_contract
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("dalilak.main")
 
 # ═══════════════════════════════════════════════════════════════
 #  DOCUMENT EXTRACTION HELPERS
@@ -92,10 +99,15 @@ MAX_CHARS      = 16000
 MAX_DOC_TOKENS = 4000
 
 # Auth config
-JWT_SECRET   = os.environ.get("JWT_SECRET", "dalilak-secret-CHANGE-IN-PROD")
+_ENV = os.environ.get("ENVIRONMENT", "development")
+JWT_SECRET   = os.environ.get("JWT_SECRET") or ("dalilak-dev-secret" if _ENV != "production" else None)
 JWT_ALGO     = "HS256"
 TRIAL_DAYS   = 3
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "dalilak-admin-CHANGE-IN-PROD")
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET") or ("dalilak-dev-admin" if _ENV != "production" else None)
+if _ENV == "production":
+    _missing = [k for k, v in [("JWT_SECRET", JWT_SECRET), ("ADMIN_SECRET", ADMIN_SECRET), ("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY")), ("QDRANT_URL", os.environ.get("QDRANT_URL"))] if not v]
+    if _missing:
+        raise RuntimeError(f"Missing required env vars: {', '.join(_missing)}")
 
 # Qdrant collections for users & logs
 USERS_COL    = "dalilak_users"
@@ -539,16 +551,6 @@ class UploadDocumentRequest(BaseModel):
     file_name: str = Field(..., max_length=255)
     transaction_id: Optional[str] = Field(default=None, max_length=36)
 
-_ALLOWED_MIME_TYPES = frozenset({
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "text/plain",
-    "image/jpeg",
-    "image/png",
-    "image/jpg",
-})
-
 # ═══════════════════════════════════════════════════════════════
 #  STARTUP PRELOADER  (warm embedding + answer cache)
 # ═══════════════════════════════════════════════════════════════
@@ -602,9 +604,37 @@ async def _preload() -> None:
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
+    # Initialize SQLAlchemy database
+    try:
+        init_db()
+        logger.info("✅ Database initialized")
+    except Exception as e:
+        logger.warning(f"DB init warning (non-fatal): {e}")
+
+    # Bootstrap first admin
+    admin_username = os.environ.get("ADMIN_USERNAME")
+    admin_password = os.environ.get("ADMIN_PASSWORD")
+    admin_email    = os.environ.get("ADMIN_EMAIL", "admin@dalilak.ai")
+    if admin_username and admin_password:
+        if not db_get_user(admin_username.lower()):
+            db_save_user({
+                "username":        admin_username.lower(),
+                "email":           admin_email,
+                "password_hash":   hash_pw(admin_password),
+                "full_name":       "Admin",
+                "phone":           "",
+                "plan":            "admin",
+                "role":            "admin",
+                "active":          True,
+                "trial_expires_at": None,
+                "paid_until":      None,
+                "created_at":      datetime.now(timezone.utc).isoformat(),
+                "last_login":      None,
+            })
+
     asyncio.create_task(_preload())
     yield
-    # Cleanup: close persistent HTTP client
+    # Cleanup
     global _http
     if _http and not _http.is_closed:
         await _http.aclose()
@@ -628,6 +658,23 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Admin-Secret"],
     allow_credentials=True,
 )
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        if os.environ.get("ENVIRONMENT") == "production":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 from collections import defaultdict
@@ -932,6 +979,18 @@ async def health():
 async def ping():
     return {"pong": True}
 
+@app.get("/ready")
+async def ready():
+    """Readiness check — verifies Qdrant and OpenAI key are configured."""
+    checks = {}
+    checks["qdrant_url"] = bool(os.environ.get("QDRANT_URL"))
+    checks["openai_key"] = bool(os.environ.get("OPENAI_API_KEY"))
+    checks["jwt_secret"] = bool(JWT_SECRET)
+    all_ready = all(checks.values())
+    if not all_ready:
+        raise HTTPException(503, detail={"ready": False, "checks": checks})
+    return {"ready": True, "checks": checks}
+
 # ═══════════════════════════════════════════════════════════════
 #  AUTH ENDPOINTS
 # ═══════════════════════════════════════════════════════════════
@@ -1167,7 +1226,15 @@ async def admin_create_user(req: CreateUserRequest, user: dict = Depends(get_adm
         "last_login":      None,
     }
     db_save_user(new_user)
-    return {"message": f"تم إنشاء المستخدم {req.username}", "user": new_user}
+    return {"message": f"تم إنشاء المستخدم {req.username}", "user": {
+        "username": new_user["username"],
+        "email": new_user["email"],
+        "full_name": new_user["full_name"],
+        "plan": new_user["plan"],
+        "role": new_user["role"],
+        "active": new_user["active"],
+        "created_at": new_user["created_at"],
+    }}
 
 @app.put("/admin/users/{username}")
 async def admin_update_user(
@@ -1460,36 +1527,6 @@ async def analyze_stream(req: AnalyzeRequest, user: dict = Depends(get_current_u
     return StreamingResponse(generate(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-# Bootstrap first admin if ADMIN_USERNAME set
-@app.on_event("startup")
-async def startup():
-    # Initialize SQLAlchemy database (SQLite default, PostgreSQL via DATABASE_URL)
-    try:
-        init_db()
-        logger.info("✅ Database initialized (SQLite/PostgreSQL)")
-    except Exception as e:
-        logger.warning(f"DB init warning (non-fatal): {e}")
-
-    admin_username = os.environ.get("ADMIN_USERNAME")
-    admin_password = os.environ.get("ADMIN_PASSWORD")
-    admin_email    = os.environ.get("ADMIN_EMAIL", "admin@dalilak.ai")
-    if admin_username and admin_password:
-        if not db_get_user(admin_username.lower()):
-            db_save_user({
-                "username":        admin_username.lower(),
-                "email":           admin_email,
-                "password_hash":   hash_pw(admin_password),
-                "full_name":       "Admin",
-                "phone":           "",
-                "plan":            "admin",
-                "role":            "admin",
-                "active":          True,
-                "trial_expires_at": None,
-                "paid_until":      None,
-                "created_at":      datetime.now(timezone.utc).isoformat(),
-                "last_login":      None,
-            })
-
 # ── Document Upload Stubs (Phase 8) ──────────────────────────────────────────
 # TODO: Replace stubs with real storage (S3/Cloudflare R2) + PDF extraction
 
@@ -1620,7 +1657,7 @@ async def submit_feedback(req: FeedbackRequest, user: dict = Depends(get_current
         }
         qdrant().upsert(
             collection_name="dalilak_logs",
-            points=[PointStruct(id=str(uuid.uuid4()), vector=[0.0] * 3072, payload=payload)]
+            points=[PointStruct(id=str(uuid.uuid4()), vector=[1.0], payload=payload)]
         )
         # Also log thumbs-down as content gap
         if req.rating == "down":
@@ -2320,7 +2357,7 @@ async def request_escalation(req: EscalationRequest, user: dict = Depends(get_cu
         }
         qdrant().upsert(
             collection_name="dalilak_logs",
-            points=[PointStruct(id=str(uuid.uuid4()), vector=[0.0] * 3072, payload=payload)]
+            points=[PointStruct(id=str(uuid.uuid4()), vector=[1.0], payload=payload)]
         )
     except Exception as e:
         logger.warning(f"Escalation log failed: {e}")
