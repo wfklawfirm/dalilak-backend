@@ -1329,6 +1329,43 @@ async def admin_list_resets(admin: dict = Depends(get_admin_user)):
 #  CHAT ENDPOINTS (protected)
 # ═══════════════════════════════════════════════════════════════
 
+class SuggestFollowupRequest(BaseModel):
+    question: str = Field(..., max_length=500)
+    answer:   str = Field(default='', max_length=1000)
+    lang:     str = Field(default='ar', max_length=2)
+
+@app.post("/suggest_followup")
+async def suggest_followup(req: SuggestFollowupRequest, user: dict = Depends(get_current_user)):
+    """Return 4 short follow-up questions related to the given question/answer pair."""
+    try:
+        if req.lang == 'en':
+            prompt = (
+                f'Based on this Lebanese government services question: "{req.question}"\n'
+                'Write exactly 4 short follow-up questions (one per line, no numbers, no bullets):'
+            )
+        else:
+            prompt = (
+                f'بناءً على هذا السؤال المتعلق بالإجراءات الحكومية اللبنانية: "{req.question}"\n'
+                'اكتب 4 أسئلة متابعة مختصرة (سطر واحد لكل سؤال، بدون أرقام أو نقاط):'
+            )
+
+        resp = await oai().chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            max_tokens=200,
+            temperature=0.7,
+        )
+        raw = resp.choices[0].message.content or ''
+        questions = [
+            l.strip().lstrip('0123456789.-• ').strip()
+            for l in raw.split('\n')
+            if l.strip() and len(l.strip()) > 6
+        ][:4]
+        return {'questions': questions}
+    except Exception as e:
+        logger.warning(f'suggest_followup error: {e}')
+        return {'questions': []}
+
 @app.post("/chat")
 async def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
     ck = _ck(req.message, req.domain)
