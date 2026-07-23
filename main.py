@@ -11,12 +11,15 @@ import logging
 import os
 import re
 import secrets
+import smtplib
 import time
 import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import AsyncGenerator, Optional
 
 import httpx
@@ -108,6 +111,17 @@ if _ENV == "production":
     _missing = [k for k, v in [("JWT_SECRET", JWT_SECRET), ("ADMIN_SECRET", ADMIN_SECRET), ("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY")), ("QDRANT_URL", os.environ.get("QDRANT_URL"))] if not v]
     if _missing:
         raise RuntimeError(f"Missing required env vars: {', '.join(_missing)}")
+
+# Email (password reset) — optional. If SMTP_HOST/SMTP_USER/SMTP_PASSWORD are not
+# set, forgot_password() silently falls back to the previous admin-relay behavior
+# instead of failing, so this is safe to deploy before SMTP credentials exist.
+SMTP_HOST     = os.environ.get("SMTP_HOST")
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER     = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_FROM     = os.environ.get("SMTP_FROM") or SMTP_USER or "no-reply@dalilak.ai"
+FRONTEND_URL  = os.environ.get("FRONTEND_URL", "https://dalilak-frontend.vercel.app")
+EMAIL_ENABLED = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
 
 # Qdrant collections for users & logs
 USERS_COL    = "dalilak_users"
@@ -1114,19 +1128,68 @@ async def me(user: dict = Depends(get_current_user)):
         "created_at":      user.get("created_at"),
     }
 
+def send_reset_email(to_email: str, code: str) -> bool:
+    """Sends the password-reset code by email via SMTP. Returns True on success,
+    False on any failure (network, auth, missing config) — callers must not
+    assume the email arrived and should keep the existing admin-relay fallback
+    available regardless of this function's outcome."""
+    if not EMAIL_ENABLED:
+        return False
+    reset_link = f"{FRONTEND_URL}/reset-password?token={code}"
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "دليلك — رمز إعادة تعيين كلمة المرور"
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+
+        text = (
+            f"رمز إعادة تعيين كلمة المرور الخاص بك هو: {code}\n"
+            f"صالح لمدة ساعة واحدة.\n\n"
+            f"أو اضغط على الرابط التالي لإعادة التعيين مباشرة:\n{reset_link}\n\n"
+            f"إذا لم تطلب هذا، تجاهل هذه الرسالة."
+        )
+        html = f"""
+        <div dir="rtl" style="font-family:Cairo,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;">
+          <h2 style="color:#8F1D2C;">دليلك</h2>
+          <p>رمز إعادة تعيين كلمة المرور الخاص بك هو:</p>
+          <p style="font-size:28px;font-weight:800;letter-spacing:4px;color:#191713;">{code}</p>
+          <p style="color:#6B7280;font-size:13px;">صالح لمدة ساعة واحدة.</p>
+          <p><a href="{reset_link}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#8F1D2C;color:#fff;border-radius:8px;text-decoration:none;">إعادة تعيين كلمة المرور</a></p>
+          <p style="color:#9CA3AF;font-size:11px;margin-top:24px;">إذا لم تطلب هذا، تجاهل هذه الرسالة بأمان.</p>
+        </div>
+        """
+        msg.attach(MIMEText(text, "plain", "utf-8"))
+        msg.attach(MIMEText(html, "html", "utf-8"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, [to_email], msg.as_string())
+        return True
+    except Exception:
+        logging.exception("send_reset_email failed")
+        return False
+
 @app.post("/auth/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest):
     user = db_get_user_by_email(req.email.lower())
     # Always return success (don't reveal if email exists)
     if not user:
-        return {"message": "إذا كان البريد مسجّلاً، ستتلقى رمز الاستعادة من الدعم الفني."}
+        return {"message": "إذا كان البريد مسجّلاً، ستتلقى رمز الاستعادة على بريدك الإلكتروني."}
 
     # Generate 6-digit reset code valid for 1 hour
     token = str(secrets.randbelow(900000) + 100000)  # 100000–999999
     expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
     db_save_reset(user["username"], token, expires)
 
-    # In production: send email. For now: admin sees token in dashboard.
+    emailed = send_reset_email(user["email"], token)
+    if emailed:
+        return {
+            "message": "تم إرسال رمز الاستعادة إلى بريدك الإلكتروني.",
+            "info": "افتح بريدك الإلكتروني واتبع الرابط أو أدخل الرمز المكوّن من 6 أرقام.",
+        }
+    # SMTP not configured yet or send failed — keep the previous admin-relay
+    # fallback so the account is never unrecoverable.
     return {
         "message": "تم إنشاء رمز الاستعادة — تواصل مع الدعم الفني للحصول عليه.",
         "info": "سيتواصل معك فريق الدعم عبر البريد الإلكتروني.",
